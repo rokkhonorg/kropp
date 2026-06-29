@@ -32,6 +32,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # SAM3 pulls C++ deps (esaxx-rs / onig) that link against clang's
+      # compiler-rt; pin a stable Xcode so its clang resource path resolves on
+      # the macOS runner.
+      - name: Select Xcode (macOS)
+        if: runner.os == 'macOS'
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: latest-stable
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
