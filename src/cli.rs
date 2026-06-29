@@ -74,6 +74,12 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub alpha: bool,
 
+    /// Write crops in the input's lossy format instead of converting to PNG.
+    /// By default a lossy input (e.g. JPEG) is written as lossless PNG so the
+    /// crop isn't recompressed; lossless inputs always keep their format.
+    #[arg(long, default_value_t = false)]
+    pub allow_lossy_conversion: bool,
+
     /// Report the detected angle but skip rotating crops to upright.
     #[arg(long, default_value_t = false)]
     pub no_deskew: bool,

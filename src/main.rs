@@ -54,6 +54,7 @@ fn run_single(args: &Args, input_path: &Path, cutoff: u8) -> Result<()> {
         args.output.as_deref(),
         None,
         args.alpha,
+        args.allow_lossy_conversion,
         input_format,
         false,
     )?;
@@ -93,6 +94,7 @@ fn run_directory(args: &Args, input_path: &Path, cutoff: u8) -> Result<()> {
             None,
             Some(output_dir),
             args.alpha,
+            args.allow_lossy_conversion,
             input_format,
             true,
         )?;

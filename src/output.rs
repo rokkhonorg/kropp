@@ -30,6 +30,7 @@ impl OutputPlan {
         output: Option<&str>,
         output_dir: Option<&str>,
         alpha: bool,
+        allow_lossy: bool,
         input_format: ImageFormat,
         input_is_dir: bool,
     ) -> Result<Self> {
@@ -45,14 +46,7 @@ impl OutputPlan {
                     .file_name()
                     .context("directory inputs must have a file name")?,
             );
-            let mut format = input_format;
-
-            if alpha && !format_supports_alpha(format) {
-                format = ImageFormat::Png;
-                base.set_extension("png");
-            } else if base.extension().is_none() {
-                base.set_extension(preferred_extension(format));
-            }
+            let format = resolve_format(&mut base, input_format, alpha, allow_lossy);
 
             if !format.writing_enabled() {
                 bail!("output format {format:?} is not enabled for writing");
@@ -68,16 +62,10 @@ impl OutputPlan {
         let mut base = output
             .map(PathBuf::from)
             .unwrap_or_else(|| input.to_path_buf());
-        let mut format = output
+        let requested_format = output
             .and_then(|p| ImageFormat::from_path(p).ok())
             .unwrap_or(input_format);
-
-        if alpha && !format_supports_alpha(format) {
-            format = ImageFormat::Png;
-            base.set_extension("png");
-        } else if base.extension().is_none() {
-            base.set_extension(preferred_extension(format));
-        }
+        let format = resolve_format(&mut base, requested_format, alpha, allow_lossy);
 
         if !format.writing_enabled() {
             bail!("output format {format:?} is not enabled for writing");
@@ -91,8 +79,37 @@ impl OutputPlan {
     }
 }
 
+/// Resolve the final output format and align `base`'s extension to it. A lossy
+/// target is redirected to lossless PNG (unless `allow_lossy` is set) so crops
+/// aren't silently recompressed; lossless targets are kept as is. Alpha output
+/// likewise falls back to PNG when the chosen format has no alpha channel.
+fn resolve_format(
+    base: &mut PathBuf,
+    mut format: ImageFormat,
+    alpha: bool,
+    allow_lossy: bool,
+) -> ImageFormat {
+    // Redirect to PNG when alpha needs a channel the format lacks, or when a
+    // lossy target would recompress the crop and the user hasn't opted in.
+    let needs_png =
+        (alpha && !format_supports_alpha(format)) || (!allow_lossy && is_lossy_format(format));
+    if needs_png {
+        format = ImageFormat::Png;
+        base.set_extension("png");
+    } else if base.extension().is_none() {
+        base.set_extension(preferred_extension(format));
+    }
+    format
+}
+
 fn preferred_extension(format: ImageFormat) -> &'static str {
     format.extensions_str().first().copied().unwrap_or("png")
+}
+
+/// Whether re-encoding to `format` discards image data. These are the lossy
+/// encoders `image` can write; everything else it supports is lossless.
+fn is_lossy_format(format: ImageFormat) -> bool {
+    matches!(format, ImageFormat::Jpeg | ImageFormat::Avif)
 }
 
 fn format_supports_alpha(format: ImageFormat) -> bool {
@@ -579,12 +596,30 @@ mod tests {
     }
 
     #[test]
-    fn default_output_uses_input_stem_and_extension() {
+    fn lossy_input_converts_to_png_by_default() {
         let plan = OutputPlan::new(
             Path::new("fixtures/photo.jpeg"),
             None,
             None,
             false,
+            false,
+            ImageFormat::Jpeg,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(3), PathBuf::from("fixtures/photo_3.png"));
+        assert_eq!(plan.format, ImageFormat::Png);
+    }
+
+    #[test]
+    fn allow_lossy_conversion_keeps_lossy_format() {
+        let plan = OutputPlan::new(
+            Path::new("fixtures/photo.jpeg"),
+            None,
+            None,
+            false,
+            true,
             ImageFormat::Jpeg,
             false,
         )
@@ -595,12 +630,30 @@ mod tests {
     }
 
     #[test]
+    fn lossless_input_keeps_its_format() {
+        let plan = OutputPlan::new(
+            Path::new("scan.tiff"),
+            None,
+            None,
+            false,
+            false,
+            ImageFormat::Tiff,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(0), PathBuf::from("scan_0.tiff"));
+        assert_eq!(plan.format, ImageFormat::Tiff);
+    }
+
+    #[test]
     fn alpha_output_falls_back_to_png_when_format_lacks_alpha() {
         let plan = OutputPlan::new(
             Path::new("photo.jpg"),
             None,
             None,
             true,
+            false,
             ImageFormat::Jpeg,
             false,
         )
@@ -617,6 +670,7 @@ mod tests {
             None,
             None,
             true,
+            false,
             ImageFormat::Tiff,
             false,
         )
@@ -633,12 +687,30 @@ mod tests {
             None,
             Some("out"),
             false,
+            true,
             ImageFormat::Jpeg,
             true,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(2), PathBuf::from("out/photo_2.jpg"));
+    }
+
+    #[test]
+    fn dir_input_converts_lossy_to_png_by_default() {
+        let plan = OutputPlan::new(
+            Path::new("inputs/photo.jpg"),
+            None,
+            Some("out"),
+            false,
+            false,
+            ImageFormat::Jpeg,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(2), PathBuf::from("out/photo_2.png"));
+        assert_eq!(plan.format, ImageFormat::Png);
     }
 
     #[test]

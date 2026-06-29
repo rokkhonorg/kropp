@@ -24,7 +24,9 @@ Single image:
 kropp -i photo.jpg
 ```
 
-This writes `photo_0.jpg`, `photo_1.jpg`, … — one file per object found.
+This writes `photo_0.png`, `photo_1.png`, … — one file per object found. A lossy
+input like JPEG is saved as lossless PNG by default so the crop isn't
+recompressed (see [Output format](#output-format)).
 
 Pick the output name (the `_<index>` suffix is still added per object):
 
@@ -58,9 +60,25 @@ kropp -i photo.jpg --alpha
 | `-m, --min-area` | `0` | Drop objects smaller than this many pixels |
 | `--min-side-percent` | `10` | Drop objects whose longer side is under this % of the smaller image dimension |
 | `--alpha` | off | Transparent (RGBA) cutout instead of a rectangular RGB crop |
+| `--allow-lossy-conversion` | off | Keep the input's lossy format instead of converting to PNG |
 | `--no-deskew` | off | Report the angle but don't rotate crops upright |
 | `--overwrite` | off | Reprocess directory inputs even if outputs already exist |
 | `-v, --debug` | off | Print per-object diagnostics and write overlay images |
+
+## Output format
+
+By default the output format follows the input, with one exception: a **lossy**
+input (JPEG, AVIF) is written as lossless **PNG** so cropping and deskewing don't
+recompress it. **Lossless** inputs (PNG, TIFF, BMP, …) keep their own format.
+
+Pass `--allow-lossy-conversion` to write the lossy format anyway:
+
+```sh
+kropp -i photo.jpg --allow-lossy-conversion   # -> photo_0.jpg
+```
+
+An explicit `-o name.ext` still picks the format from its extension (and is
+itself redirected to PNG if lossy, unless `--allow-lossy-conversion` is set).
 
 ## Deskew and orientation
 
