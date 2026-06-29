@@ -44,6 +44,31 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      # The cc crate emits `-lclang_rt.osx` with a guessed clang resource path
+      # that doesn't exist on the runner, and the link uses `-nodefaultlibs` so
+      # there's no fallback search. Find the real libclang_rt.osx.a and add its
+      # directory to the link search path. Set before rust-cache so it's part of
+      # the cache key.
+      - name: Provide clang runtime path (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          libdir=""
+          for base in \
+            "$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang" \
+            "/Library/Developer/CommandLineTools/usr/lib/clang"; do
+            [ -d "$base" ] || continue
+            hit="$(find "$base" -name libclang_rt.osx.a 2>/dev/null | head -1 || true)"
+            if [ -n "$hit" ]; then libdir="$(dirname "$hit")"; break; fi
+          done
+          if [ -z "$libdir" ]; then
+            echo "could not find libclang_rt.osx.a" >&2
+            exit 1
+          fi
+          echo "clang runtime dir: $libdir"
+          echo "RUSTFLAGS=${RUSTFLAGS:-} -L $libdir" >> "$GITHUB_ENV"
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
