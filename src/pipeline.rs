@@ -157,7 +157,19 @@ impl Pipeline {
         // rectangle drawn blue is used only for RGB crop bounds after deskew.
         let fit_corners = angle::mask_rect_corners(&mask, crop_fit);
         let auto_text = !args.text && is_non_rectangular;
-        let use_text = args.text || auto_text;
+        // Count bbox sides sitting on the image border. An object clipped on two
+        // or more sides is too partial to trust mask geometry for orientation, so
+        // also run the text detector and prefer its angle when text is found; with
+        // no text it just falls back to the mask angle, as before.
+        let clipped_sides = (obj.min_x == 0) as u8
+            + (obj.min_y == 0) as u8
+            + (obj.max_x + 1 == w as usize) as u8
+            + (obj.max_y + 1 == src.height() as usize) as u8;
+        let many_clipped = clipped_sides >= 2;
+        if args.debug && many_clipped {
+            elog!("    clipped on {clipped_sides} sides -> text orientation enabled");
+        }
+        let use_text = args.text || auto_text || many_clipped;
         // Rectangular objects with enclosed holes (e.g. a cassette's reel
         // windows) are complex like non-rectangular ones, so give them the same
         // breathing-room padding. Skip the (cheap-ish) hole scan when the object
@@ -341,7 +353,8 @@ impl Pipeline {
         }
 
         if use_text {
-            // Non-rectangular / forced: vote 0 vs 180 over the text lines.
+            // Non-rectangular / forced / clipped: vote 0 vs 180 over the text
+            // lines. No text found means the mask drove the angle, so no turn.
             if text_boxes.is_empty() || self.textline_unavailable {
                 return Ok(0);
             }
