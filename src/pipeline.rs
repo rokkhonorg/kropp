@@ -164,7 +164,7 @@ impl Pipeline {
         // the Max/safezone fit so no Min/body logic is applied to it.
         let rectangularity = angle::mask_rectangularity(&mask, angle::MaskFit::Max);
         let is_non_rectangular =
-            rectangularity.is_some_and(|r| r < args.auto_text_rectangularity_threshold);
+            rectangularity.is_some_and(|r| r < args.rectangularity_threshold());
         let angle_fit = angle::MaskFit::Max;
         let crop_fit = if args.safezone || is_non_rectangular {
             angle::MaskFit::Max
@@ -441,6 +441,8 @@ impl Pipeline {
             Some(r) => {
                 let mode = if args.text {
                     "forced by --text"
+                } else if args.force_rectangular {
+                    "forced rectangular"
                 } else if auto_text {
                     "auto text enabled"
                 } else {
@@ -448,7 +450,7 @@ impl Pipeline {
                 };
                 elog!(
                     "    rectangularity: {r:.3} (threshold {:.3}; {mode}; padding {crop_padding:.1}%)",
-                    args.auto_text_rectangularity_threshold,
+                    args.rectangularity_threshold(),
                 );
             }
             None => elog!("    rectangularity: n/a (mask only)"),

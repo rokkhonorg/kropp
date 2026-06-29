@@ -62,6 +62,13 @@ pub struct Args {
     #[arg(long, default_value_t = 0.30)]
     pub auto_text_rectangularity_threshold: f64,
 
+    /// Force every object through the rectangular pipeline, ignoring its
+    /// rectangularity score (equivalent to
+    /// `--auto-text-rectangularity-threshold 0`). Cannot be combined with
+    /// `--text`, which forces the opposite.
+    #[arg(long, default_value_t = false, conflicts_with = "text")]
+    pub force_rectangular: bool,
+
     /// Padding percentage to add around non-rectangular objects after the final
     /// tight crop. Applied per side; 2 means 2% of the crop width on left/right
     /// and 5% of the crop height on top/bottom.
@@ -121,6 +128,17 @@ pub struct Args {
 }
 
 impl Args {
+    /// The effective auto-text rectangularity threshold. `--force-rectangular`
+    /// pins it to 0 so no object scores as non-rectangular and every object
+    /// takes the rectangular pipeline.
+    pub fn rectangularity_threshold(&self) -> f64 {
+        if self.force_rectangular {
+            0.0
+        } else {
+            self.auto_text_rectangularity_threshold
+        }
+    }
+
     /// Validate the numeric ranges and return the alpha cutoff on the 0..=255
     /// scale derived from `threshold`.
     pub fn validate(&self) -> Result<u8> {
@@ -147,5 +165,25 @@ impl Args {
         }
         // Convert the percentage cutoff to the 0..=255 alpha scale.
         Ok((self.threshold / 100.0 * 255.0).round() as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_rectangular_pins_rectangularity_threshold_to_zero() {
+        let forced = Args::parse_from(["kropp", "-i", "x", "--force-rectangular"]);
+        assert_eq!(forced.rectangularity_threshold(), 0.0);
+
+        let default = Args::parse_from(["kropp", "-i", "x"]);
+        assert_eq!(default.rectangularity_threshold(), 0.30);
+    }
+
+    #[test]
+    fn force_rectangular_conflicts_with_text() {
+        let result = Args::try_parse_from(["kropp", "-i", "x", "--text", "--force-rectangular"]);
+        assert!(result.is_err());
     }
 }

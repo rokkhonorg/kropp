@@ -59,6 +59,8 @@ kropp -i photo.jpg --alpha
 | `-t, --threshold` | `95` | Alpha cutoff %: below this is transparent, at/above is kept |
 | `-m, --min-area` | `0` | Drop objects smaller than this many pixels |
 | `--min-side-percent` | `10` | Drop objects whose longer side is under this % of the smaller image dimension |
+| `--text` | off | Force text-based rotation for every object |
+| `--force-rectangular` | off | Force the rectangular pipeline for every object (ignores the rectangularity score) |
 | `--alpha` | off | Transparent (RGBA) cutout instead of a rectangular RGB crop |
 | `--allow-lossy-conversion` | off | Keep the input's lossy format instead of converting to PNG |
 | `--no-deskew` | off | Report the angle but don't rotate crops upright |
@@ -88,6 +90,14 @@ By default kropp straightens each crop:
   (0/90/180/270). Disable with `--no-doc-orient`.
 - **Non-rectangular objects** are straightened using detected text lines, with a
   0/180 flip vote. Pass `--text` to force text-based rotation on every object.
+
+Which path an object takes is decided by its rectangularity score against
+`--auto-text-rectangularity-threshold`. To force one path for every object:
+
+- `--text` — always use the text path.
+- `--force-rectangular` — always use the rectangular path, ignoring the score
+  (the same as `--auto-text-rectangularity-threshold 0`). The two are mutually
+  exclusive.
 
 Run `kropp --help` for the full list of options.
 
