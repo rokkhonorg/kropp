@@ -71,9 +71,18 @@ fn run() -> Result<()> {
 
     // Build the extractor (and lazy classifiers) once and reuse across every input.
     let mut pipeline = Pipeline::new(&args, cutoff)?;
+    // With several inputs (e.g. dragging multiple files onto the exe) one bad
+    // file shouldn't abort the rest — report it and carry on. A single input
+    // stays fatal so its error surfaces directly.
     let multi = inputs.len() > 1;
     for input in &inputs {
-        process_input(&mut pipeline, input, &args, multi)?;
+        if let Err(e) = process_input(&mut pipeline, input, &args, multi) {
+            if multi {
+                elog!("skipping {}: {e:#}", input.display());
+            } else {
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
@@ -142,26 +151,40 @@ fn process_directory(
             continue;
         }
 
-        let (src_original, input_format) = read_original_image(&input_file)?;
-        let output_plan = OutputPlan::new(
-            &input_file,
-            None,
-            Some(output_dir_str),
-            args.alpha,
-            args.allow_lossy_conversion,
-            input_format,
-            true,
-        )?;
-        let model_input = input_file.to_string_lossy();
-        pipeline.process_image(
-            &src_original,
-            &model_input,
-            args,
-            &output_plan,
-            Some(&input_file),
-        )?;
+        // A batch shouldn't abort because one scan has no objects (or fails to
+        // decode): report the file and move on.
+        if let Err(e) = process_dir_file(pipeline, &input_file, output_dir_str, args) {
+            elog!("skipping {}: {e:#}", input_file.display());
+        }
     }
     Ok(())
+}
+
+/// Process one file within a directory batch, writing its crops into `output_dir`.
+fn process_dir_file(
+    pipeline: &mut Pipeline,
+    input_file: &Path,
+    output_dir: &str,
+    args: &Args,
+) -> Result<()> {
+    let (src_original, input_format) = read_original_image(input_file)?;
+    let output_plan = OutputPlan::new(
+        input_file,
+        None,
+        Some(output_dir),
+        args.alpha,
+        args.allow_lossy_conversion,
+        input_format,
+        true,
+    )?;
+    let model_input = input_file.to_string_lossy();
+    pipeline.process_image(
+        &src_original,
+        &model_input,
+        args,
+        &output_plan,
+        Some(input_file),
+    )
 }
 
 /// Process a single input file. Output goes to `--output-dir` if set, else the

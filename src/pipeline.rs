@@ -98,7 +98,7 @@ impl Pipeline {
         // Drop noise: components no side of which is large relative to the image.
         objects.retain(|obj| meets_min_side(obj, w as usize, h as usize, args.min_side_percent));
         if objects.is_empty() {
-            bail!("no objects found above the threshold");
+            bail!("no foreground objects found");
         }
 
         for (idx, obj) in objects.iter().enumerate() {
