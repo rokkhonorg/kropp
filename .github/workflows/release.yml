@@ -1,0 +1,67 @@
+name: Release
+
+# When a version tag (v*) is pushed, build release binaries for each platform
+# and attach them to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # needed to create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bin: kropp.exe
+            suffix: windows-x86_64
+          - os: ubuntu-latest
+            bin: kropp
+            suffix: linux-x86_64
+          - os: macos-latest
+            bin: kropp
+            suffix: macos-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Package the binary together with the licence and readme.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ASSET="kropp-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz"
+          mkdir dist
+          cp "target/release/${{ matrix.bin }}" LICENSE README.md dist/
+          tar -czf "$ASSET" -C dist .
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "kropp-$env:GITHUB_REF_NAME-${{ matrix.suffix }}.zip"
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "target/release/${{ matrix.bin }}", LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath $asset
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
