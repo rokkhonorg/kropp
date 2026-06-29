@@ -1,0 +1,12 @@
+# usls's `sam3` feature pulls in HuggingFace `tokenizers`, whose `esaxx-rs`
+# dependency compiles its C++ with the static CRT (`/MT`, via `.static_crt(true)`
+# in its build script). ort's onnxruntime links the dynamic CRT (`/MD`), and
+# MSVC refuses to mix the two (LNK2038). esaxx is only used for Unigram training,
+# which we never do, but tokenizers' default features force it in and feature
+# unification means we can't drop it.
+#
+# `_CL_` appends its options *after* cl.exe's command line, so `/MD` overrides
+# esaxx's `/MT` on MSVC. gcc/clang on Linux/macOS ignore `_CL_`, so this is
+# safe across platforms.
+[env]
+_CL_ = "/MD"

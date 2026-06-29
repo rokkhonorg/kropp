@@ -4,8 +4,8 @@ Crop and deskew objects from a flatbed scan. kropp finds each object in a scan,
 straightens it upright, and writes one cropped file per object — handy for
 digitizing a stack of photos, receipts, or documents laid on the glass.
 
-Foreground detection currently uses the RMBG background-removal model; other
-methods may be added later.
+Foreground detection runs through a swappable extractor — RMBG by default, or
+SAM3 — see [Extraction modes](#extraction-modes).
 
 ## Build
 
@@ -13,8 +13,15 @@ methods may be added later.
 cargo build --release
 ```
 
-The model weights download automatically on first run. kropp tries CUDA, then
+Model weights download automatically on first run. kropp tries CUDA, then
 DirectML, then CPU, and uses whichever is available.
+
+SAM3 support is behind the `sam3` cargo feature, which is **on by default**. To
+build an RMBG-only binary (no SAM3, lighter dependencies):
+
+```sh
+cargo build --release --no-default-features
+```
 
 ## Usage
 
@@ -64,7 +71,8 @@ kropp -i photo.jpg --alpha
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `-i, --input` | — | Input image or directory (required) |
+| `-i, --input` | — | Input image or directory (or pass paths positionally) |
+| `--extractor` | `rmbg` | Foreground extractor: `rmbg`, `sam3-bg`, or `sam3-fg` (see [Extraction modes](#extraction-modes)) |
 | `-o, --output` | input name | Output path for a single input file |
 | `--output-dir` | — | Output directory (required when input is a directory) |
 | `-t, --threshold` | `95` | Alpha cutoff %: below this is transparent, at/above is kept |
@@ -92,6 +100,29 @@ kropp -i photo.jpg --allow-lossy-conversion   # -> photo_0.jpg
 
 An explicit `-o name.ext` still picks the format from its extension (and is
 itself redirected to PNG if lossy, unless `--allow-lossy-conversion` is set).
+
+## Extraction modes
+
+How kropp finds the foreground objects (before any cropping or deskewing) is
+chosen with `--extractor`:
+
+| Mode | What it does |
+| --- | --- |
+| `rmbg` (default) | RMBG background-removal model: one alpha mask, thresholded and split into objects by connected components. |
+| `sam3-bg` | SAM3 "background inversion": segment the background by text prompt (`--sam-background`, default `"background"`), invert it to one foreground mask, then split by connected components. |
+| `sam3-fg` | SAM3 multi-prompt: run each object prompt (`--sam-prompt`, repeatable), then merge overlapping detections by IoU (`--sam-overlap`) into distinct objects. |
+
+```sh
+# SAM3 background inversion
+kropp scan.tif --extractor sam3-bg
+
+# SAM3 multi-prompt, several object types at once
+kropp scan.tif --extractor sam3-fg --sam-prompt photo --sam-prompt postcard
+```
+
+The `sam3-*` modes need a build with the `sam3` feature (the default). SAM3
+downloads its own ONNX models on first use. `--threshold`/`-t` applies to RMBG
+only; the SAM3 masks are already binary.
 
 ## Deskew and orientation
 

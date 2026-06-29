@@ -91,6 +91,72 @@ pub fn connected_components(
     (labels, objects)
 }
 
+/// Build a label map and objects from a set of instance masks, each a `w*h`
+/// foreground bitmap. Unlike [`connected_components`], every instance stays a
+/// distinct object even if two instances touch — used by SAM3 multi-prompt
+/// extraction, where merged detections are already separated. Overlapping pixels
+/// go to the earliest instance; components below `min_area` are dropped and the
+/// rest are returned largest-first.
+#[cfg(feature = "sam3")]
+pub fn objects_from_instances(
+    instances: &[Vec<bool>],
+    w: usize,
+    h: usize,
+    min_area: usize,
+) -> (Vec<usize>, Vec<Object>) {
+    let mut labels = vec![0usize; w * h];
+    let mut objects: Vec<Object> = Vec::new();
+
+    for instance in instances {
+        let label = objects.len() + 1;
+        let mut obj: Option<Object> = None;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if !instance[i] || labels[i] != 0 {
+                    continue;
+                }
+                labels[i] = label;
+                match obj.as_mut() {
+                    Some(o) => {
+                        o.area += 1;
+                        o.min_x = o.min_x.min(x);
+                        o.min_y = o.min_y.min(y);
+                        o.max_x = o.max_x.max(x);
+                        o.max_y = o.max_y.max(y);
+                    }
+                    None => {
+                        obj = Some(Object {
+                            label,
+                            area: 1,
+                            min_x: x,
+                            min_y: y,
+                            max_x: x,
+                            max_y: y,
+                        });
+                    }
+                }
+            }
+        }
+
+        match obj {
+            Some(o) if o.area >= min_area.max(1) => objects.push(o),
+            // Drop a too-small (or empty) instance and free its label by clearing
+            // the pixels it claimed, so labels stay contiguous with `objects`.
+            _ => {
+                for l in labels.iter_mut() {
+                    if *l == label {
+                        *l = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    objects.sort_by_key(|o| std::cmp::Reverse(o.area));
+    (labels, objects)
+}
+
 /// Build an RGBA image cropped to `obj`'s bounding box, keeping opaque only the
 /// pixels whose label matches this object (so overlapping bounding boxes from
 /// other objects don't leak in); everything else is transparent.
@@ -163,5 +229,33 @@ mod tests {
         assert!(meets_min_side(&obj(0, 0, 9, 0), w, h, 10.0));
         // Disabled: the tiny box survives.
         assert!(meets_min_side(&obj(0, 0, 1, 1), w, h, 0.0));
+    }
+
+    #[cfg(feature = "sam3")]
+    #[test]
+    fn objects_from_instances_keeps_touching_instances_separate() {
+        // Two 2x2 instances sharing the middle column (they touch) in a 4x2 grid.
+        let w = 4;
+        let h = 2;
+        let mut left = vec![false; w * h];
+        let mut right = vec![false; w * h];
+        for y in 0..2 {
+            left[y * w] = true;
+            left[y * w + 1] = true;
+            right[y * w + 1] = true; // overlaps left's column 1
+            right[y * w + 2] = true;
+            right[y * w + 3] = true;
+        }
+
+        let (labels, objects) = objects_from_instances(&[left, right], w, h, 1);
+
+        // Two distinct objects despite touching; connected components would merge.
+        assert_eq!(objects.len(), 2);
+        // Earliest instance wins the shared column, so it keeps all 4 pixels and
+        // is the larger object after sorting.
+        assert_eq!(objects[0].area, 4);
+        assert_eq!(objects[1].area, 4);
+        // Every labelled pixel belongs to one of the two objects.
+        assert!(labels.iter().all(|&l| l <= 2));
     }
 }

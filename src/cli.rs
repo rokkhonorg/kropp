@@ -3,7 +3,22 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// How the foreground objects are extracted from the scan before the crop and
+/// deskew stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ExtractorKind {
+    /// RMBG background-removal model (a single alpha mask, split into objects by
+    /// connected components). The default.
+    Rmbg,
+    /// SAM3 background inversion: prompt the background, invert it to one
+    /// foreground mask, then split by connected components.
+    Sam3Bg,
+    /// SAM3 multi-prompt foreground: run each object prompt, merge overlapping
+    /// detections by IoU into distinct objects.
+    Sam3Fg,
+}
 
 /// Crop and deskew objects from a flatbed scan. Each foreground object is
 /// detected, straightened upright, and written out as its own cropped file.
@@ -26,6 +41,26 @@ pub struct Args {
     /// into that folder), unless --output/--output-dir overrides it.
     #[arg(value_name = "PATHS")]
     pub paths: Vec<PathBuf>,
+
+    /// Foreground extraction mode: `rmbg` (default), `sam3-bg` (SAM3 background
+    /// inversion), or `sam3-fg` (SAM3 multi-prompt). The SAM3 modes require a
+    /// build with the `sam3` feature (on by default).
+    #[arg(long, value_enum, default_value_t = ExtractorKind::Rmbg)]
+    pub extractor: ExtractorKind,
+
+    /// Background text prompt for `--extractor sam3-bg`. The mask of this prompt
+    /// is inverted to obtain the foreground.
+    #[arg(long, default_value = "background")]
+    pub sam_background: String,
+
+    /// Object text prompts for `--extractor sam3-fg`. Repeat to pass several;
+    /// detections are merged across prompts by IoU. Defaults to a generic set.
+    #[arg(long = "sam-prompt", value_name = "TEXT")]
+    pub sam_prompts: Vec<String>,
+
+    /// IoU threshold above which `sam3-fg` detections merge into one object.
+    #[arg(long, default_value_t = 0.001)]
+    pub sam_overlap: f64,
 
     /// Output path for a single input file; a `_<index>` suffix is added per
     /// object. Defaults to the input path's stem and format, e.g.
@@ -170,9 +205,26 @@ impl Args {
         Some(path)
     }
 
+    /// Object prompts for SAM3 multi-prompt (`sam3-fg`) mode, falling back to a
+    /// generic flatbed-scan set when none are given on the command line.
+    #[cfg(feature = "sam3")]
+    pub fn sam_fg_prompts(&self) -> Vec<String> {
+        if self.sam_prompts.is_empty() {
+            ["photo", "document", "card", "booklet", "leaflet", "disc"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.sam_prompts.clone()
+        }
+    }
+
     /// Validate the numeric ranges and return the alpha cutoff on the 0..=255
     /// scale derived from `threshold`.
     pub fn validate(&self) -> Result<u8> {
+        if !(0.0..=1.0).contains(&self.sam_overlap) {
+            bail!("sam overlap must be between 0 and 1, got {}", self.sam_overlap);
+        }
         if !(0.0..=100.0).contains(&self.threshold) {
             bail!("threshold must be between 0 and 100, got {}", self.threshold);
         }

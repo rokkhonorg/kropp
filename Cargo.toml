@@ -6,6 +6,13 @@ description = "Crop and deskew objects from flatbed scans"
 license = "MIT"
 readme = "README.md"
 
+[features]
+default = ["sam3"]
+# SAM3 text-prompted segmentation as an alternative to RMBG. Pulls in usls's
+# tokenizer stack and downloads the SAM3 ONNX models on first use; disable with
+# --no-default-features to build an RMBG-only binary.
+sam3 = ["usls/sam3"]
+
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }

@@ -4,6 +4,7 @@ mod angle;
 mod cli;
 mod components;
 mod debug_overlay;
+mod extract;
 mod model;
 mod output;
 mod pipeline;
@@ -68,11 +69,11 @@ fn run() -> Result<()> {
         }
     }
 
-    // Build the model (and lazy classifiers) once and reuse across every input.
-    let mut pipeline = Pipeline::new(&args)?;
+    // Build the extractor (and lazy classifiers) once and reuse across every input.
+    let mut pipeline = Pipeline::new(&args, cutoff)?;
     let multi = inputs.len() > 1;
     for input in &inputs {
-        process_input(&mut pipeline, input, &args, cutoff, multi)?;
+        process_input(&mut pipeline, input, &args, multi)?;
     }
     Ok(())
 }
@@ -99,13 +100,7 @@ fn resolve_inputs(args: &Args) -> Result<Vec<PathBuf>> {
 /// `--output-dir`); a file is written next to itself (or per `--output` /
 /// `--output-dir`). `label` adds the input path to the summary line when more
 /// than one input is being processed.
-fn process_input(
-    pipeline: &mut Pipeline,
-    input: &Path,
-    args: &Args,
-    cutoff: u8,
-    label: bool,
-) -> Result<()> {
+fn process_input(pipeline: &mut Pipeline, input: &Path, args: &Args, label: bool) -> Result<()> {
     if input.is_dir() {
         // Default a folder's output to the folder itself, matching the
         // drag-a-folder-on-the-exe expectation.
@@ -114,9 +109,9 @@ fn process_input(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| input.to_path_buf());
-        process_directory(pipeline, input, &output_dir, args, cutoff)
+        process_directory(pipeline, input, &output_dir, args)
     } else if input.is_file() {
-        process_file(pipeline, input, args, cutoff, label)
+        process_file(pipeline, input, args, label)
     } else {
         bail!(
             "input path is neither a file nor a directory: {}",
@@ -132,7 +127,6 @@ fn process_directory(
     dir: &Path,
     output_dir: &Path,
     args: &Args,
-    cutoff: u8,
 ) -> Result<()> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create output dir: {}", output_dir.display()))?;
@@ -163,7 +157,6 @@ fn process_directory(
             &src_original,
             &model_input,
             args,
-            cutoff,
             &output_plan,
             Some(&input_file),
         )?;
@@ -173,13 +166,7 @@ fn process_directory(
 
 /// Process a single input file. Output goes to `--output-dir` if set, else the
 /// explicit `--output`, else next to the input.
-fn process_file(
-    pipeline: &mut Pipeline,
-    input: &Path,
-    args: &Args,
-    cutoff: u8,
-    label: bool,
-) -> Result<()> {
+fn process_file(pipeline: &mut Pipeline, input: &Path, args: &Args, label: bool) -> Result<()> {
     let (src_original, input_format) = read_original_image(input)?;
     let output_plan = match &args.output_dir {
         Some(output_dir) => {
@@ -208,7 +195,7 @@ fn process_file(
 
     let model_input = input.to_string_lossy();
     let summary = label.then_some(input);
-    pipeline.process_image(&src_original, &model_input, args, cutoff, &output_plan, summary)
+    pipeline.process_image(&src_original, &model_input, args, &output_plan, summary)
 }
 
 /// Whether this process owns a freshly allocated console — the signature of an

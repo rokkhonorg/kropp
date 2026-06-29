@@ -10,15 +10,14 @@ use imageproc::drawing::draw_line_segment_mut;
 use imageproc::geometric_transformations::{
     Border, Interpolation, rotate_about_center_no_crop,
 };
-use usls::{Image, models::RMBG};
 
 use crate::angle::{self, Detector, DocOrientClassifier, OrientClassifier};
 use crate::cli::Args;
-use crate::components::{Object, connected_components, crop_object, meets_min_side};
+use crate::components::{Object, crop_object, meets_min_side};
 use crate::debug_overlay::{
     AngleSource, debug_image_path, draw_debug_overlay, log_angle_debug, log_crop_geometry,
 };
-use crate::model::build_rmbg;
+use crate::extract::{Extraction, Extractor, build_extractor};
 use crate::output::{
     AlphaOutputRequest, OutputPlan, rotated_crop_bounds, suffixed_path, write_alpha_output,
     write_rgb_output,
@@ -29,7 +28,7 @@ use crate::output::{
 /// so a missing model is reported once and then skipped. A single `Pipeline` is
 /// reused across every input file in directory mode.
 pub struct Pipeline {
-    model: RMBG,
+    extractor: Box<dyn Extractor>,
     detector: Option<Detector>,
     detector_unavailable: bool,
     textline: Option<OrientClassifier>,
@@ -39,10 +38,11 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Build the RMBG model and, when `--text` forces text rotation, eagerly load
-    /// the text detector so its absence is reported up front.
-    pub fn new(args: &Args) -> Result<Self> {
-        let model = build_rmbg()?;
+    /// Build the selected foreground extractor and, when `--text` forces text
+    /// rotation, eagerly load the text detector so its absence is reported up
+    /// front.
+    pub fn new(args: &Args, cutoff: u8) -> Result<Self> {
+        let extractor = build_extractor(args, cutoff)?;
         let detector = if args.text {
             match Detector::load() {
                 Ok(d) => Some(d),
@@ -56,7 +56,7 @@ impl Pipeline {
         };
         let detector_unavailable = args.text && detector.is_none();
         Ok(Self {
-            model,
+            extractor,
             detector,
             detector_unavailable,
             textline: None,
@@ -75,44 +75,26 @@ impl Pipeline {
         src_original: &DynamicImage,
         model_input: &str,
         args: &Args,
-        cutoff: u8,
         output_plan: &OutputPlan,
         summary_path: Option<&Path>,
     ) -> Result<()> {
-        let model_image = Image::try_read(model_input)
-            .with_context(|| format!("failed to read image: {model_input}"))?;
-        let ys = self.model.forward(std::slice::from_ref(&model_image))?;
+        // Extract foreground objects (RMBG or SAM3) into a label map at the
+        // source resolution. Everything downstream is extractor-agnostic.
+        let Extraction {
+            src,
+            width: w,
+            height: h,
+            labels,
+            mut objects,
+        } = self.extractor.extract(model_input)?;
 
-        // The model returns a grayscale alpha mask at the source resolution.
-        let mask = ys
-            .first()
-            .and_then(|y| y.masks.first())
-            .context("model returned no mask")?;
-        let alpha = mask.to_vec();
-
-        let src = model_image.to_rgba8();
-        let (w, h) = src.dimensions();
         if src_original.dimensions() != (w, h) {
             bail!(
-                "original image dimensions ({:?}) do not match model image dimensions ({w}x{h})",
+                "original image dimensions ({:?}) do not match extracted dimensions ({w}x{h})",
                 src_original.dimensions()
             );
         }
-        if (w * h) as usize != alpha.len() {
-            bail!(
-                "mask size ({}) does not match image size ({}x{})",
-                alpha.len(),
-                w,
-                h
-            );
-        }
 
-        // Binary foreground mask from the thresholded alpha.
-        let fg: Vec<bool> = alpha.iter().map(|&a| a >= cutoff).collect();
-
-        // Label disjoint objects (8-connectivity) and split each into its own file.
-        let (labels, mut objects) =
-            connected_components(&fg, w as usize, h as usize, args.min_area);
         // Drop noise: components no side of which is large relative to the image.
         objects.retain(|obj| meets_min_side(obj, w as usize, h as usize, args.min_side_percent));
         if objects.is_empty() {
