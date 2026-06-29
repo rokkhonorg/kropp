@@ -38,7 +38,8 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      # Package the binary together with the licence and readme.
+      # Package the binary with the bundled orientation model (so drag-and-drop
+      # finds onnx/bkori.onnx next to the exe) plus the licence and readme.
       - name: Package (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -46,6 +47,7 @@ jobs:
           ASSET="kropp-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz"
           mkdir dist
           cp "target/release/${{ matrix.bin }}" LICENSE README.md dist/
+          cp -r onnx dist/
           tar -czf "$ASSET" -C dist .
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
@@ -56,6 +58,7 @@ jobs:
           $asset = "kropp-$env:GITHUB_REF_NAME-${{ matrix.suffix }}.zip"
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item "target/release/${{ matrix.bin }}", LICENSE, README.md dist/
+          Copy-Item -Recurse onnx dist/
           Compress-Archive -Path dist/* -DestinationPath $asset
           "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
 

@@ -254,11 +254,12 @@ impl Pipeline {
 
         // Orientation correction: textline 0/180 vote for text-driven crops, the
         // doc-orientation model (0/90/180/270) for rectangular ones.
+        let doc_model = args.doc_orient_model_path();
         let quarter_turns = self.decide_quarter_turns(
             use_text,
             args.no_deskew,
             args.no_doc_orient,
-            args.doc_orient_model.as_deref().map(Path::new),
+            doc_model.as_deref(),
             &cutout,
             &text_boxes,
             theta,

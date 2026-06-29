@@ -18,26 +18,37 @@ DirectML, then CPU, and uses whichever is available.
 
 ## Usage
 
-Single image:
+Single image (pass the path positionally, or with `-i`):
 
 ```sh
-kropp -i photo.jpg
+kropp photo.jpg
 ```
 
-This writes `photo_0.png`, `photo_1.png`, … — one file per object found. A lossy
-input like JPEG is saved as lossless PNG by default so the crop isn't
-recompressed (see [Output format](#output-format)).
+This writes `photo_0.png`, `photo_1.png`, … next to the input — one file per
+object found. A lossy input like JPEG is saved as lossless PNG by default so the
+crop isn't recompressed (see [Output format](#output-format)).
 
-Pick the output name (the `_<index>` suffix is still added per object):
+On Windows you can **drag image files (or a folder) onto `kropp.exe`** — the
+crops are written next to each input, and the window stays open at the end so
+you can read the output.
+
+Several inputs at once (each is written next to itself):
 
 ```sh
-kropp -i photo.jpg -o cropped.png
+kropp a.jpg b.png ./scans
 ```
 
-A whole directory at once:
+Pick the output name for a single file (the `_<index>` suffix is still added per
+object):
 
 ```sh
-kropp -i ./inputs --output-dir ./outputs
+kropp photo.jpg -o cropped.png
+```
+
+Collect everything into one directory instead of writing in place:
+
+```sh
+kropp ./inputs --output-dir ./outputs
 ```
 
 Each input keeps its own name and format under the output directory. Files that
@@ -87,7 +98,8 @@ itself redirected to PNG if lossy, unless `--allow-lossy-conversion` is set).
 By default kropp straightens each crop:
 
 - **Rectangular objects** are rotated upright using a document-orientation model
-  (0/90/180/270). Disable with `--no-doc-orient`.
+  (0/90/180/270), loaded from the bundled `onnx/bkori.onnx` (kept next to the
+  executable; override with `--doc-orient-model`). Disable with `--no-doc-orient`.
 - **Non-rectangular objects** are straightened using detected text lines, with a
   0/180 flip vote. Pass `--text` to force text-based rotation on every object.
 

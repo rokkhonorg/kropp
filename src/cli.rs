@@ -1,5 +1,7 @@
 //! Command-line interface: argument parsing and validation.
 
+use std::path::PathBuf;
+
 use anyhow::{Result, bail};
 use clap::Parser;
 
@@ -12,9 +14,18 @@ use clap::Parser;
     about = "Crop and deskew objects from flatbed scans"
 )]
 pub struct Args {
-    /// Path to the input image or directory of images.
+    /// Input image or directory (explicit form). Usually you can pass paths
+    /// positionally instead — `kropp photo.jpg` — or, on Windows, drag files
+    /// onto the executable.
     #[arg(short, long)]
-    pub input: String,
+    pub input: Option<String>,
+
+    /// Input images or directories given positionally. Accepts multiple paths;
+    /// this is what Windows passes when you drag files onto the executable. By
+    /// default each object is written next to its input (a folder's crops go
+    /// into that folder), unless --output/--output-dir overrides it.
+    #[arg(value_name = "PATHS")]
+    pub paths: Vec<PathBuf>,
 
     /// Output path for a single input file; a `_<index>` suffix is added per
     /// object. Defaults to the input path's stem and format, e.g.
@@ -97,10 +108,12 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_doc_orient: bool,
 
-    /// Path to a custom (e.g. finetuned) document-orientation ONNX, loaded from
-    /// disk instead of downloading the default. Assumed to share the default's
-    /// preprocessing and 0/90/180/270 output.
-    #[arg(long)]
+    /// Path to the document-orientation ONNX used to upright rectangular crops,
+    /// loaded from disk. Defaults to the bundled `onnx/bkori.onnx`; a relative
+    /// path is resolved against the executable's directory (so it works under
+    /// drag-and-drop). Any model is assumed to share the default's preprocessing
+    /// and 0/90/180/270 output.
+    #[arg(long, default_value = "onnx/bkori.onnx")]
     pub doc_orient_model: Option<String>,
 
     /// Reprocess directory inputs even when matching outputs already exist.
@@ -137,6 +150,24 @@ impl Args {
         } else {
             self.auto_text_rectangularity_threshold
         }
+    }
+
+    /// Resolve the document-orientation model path. A relative path is resolved
+    /// against the executable's directory (not the working directory), so a model
+    /// bundled next to the exe is found regardless of where it's launched from —
+    /// e.g. under drag-and-drop. Absolute paths are used as given.
+    pub fn doc_orient_model_path(&self) -> Option<PathBuf> {
+        let path = PathBuf::from(self.doc_orient_model.as_ref()?);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            return Some(dir.join(path));
+        }
+        // No executable path available; fall back to the path as given.
+        Some(path)
     }
 
     /// Validate the numeric ranges and return the alpha cutoff on the 0..=255
@@ -185,5 +216,26 @@ mod tests {
     fn force_rectangular_conflicts_with_text() {
         let result = Args::try_parse_from(["kropp", "-i", "x", "--text", "--force-rectangular"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn positional_paths_collect_multiple_inputs() {
+        let args = Args::parse_from(["kropp", "a.jpg", "b.png", "folder"]);
+        assert_eq!(
+            args.paths,
+            vec![
+                PathBuf::from("a.jpg"),
+                PathBuf::from("b.png"),
+                PathBuf::from("folder")
+            ]
+        );
+        assert!(args.input.is_none());
+    }
+
+    #[test]
+    fn input_flag_still_parses() {
+        let args = Args::parse_from(["kropp", "-i", "photo.jpg"]);
+        assert_eq!(args.input.as_deref(), Some("photo.jpg"));
+        assert!(args.paths.is_empty());
     }
 }
