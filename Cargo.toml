@@ -2,6 +2,9 @@
 name = "kropp"
 version = "0.1.0"
 edition = "2024"
+description = "Crop and deskew objects from flatbed scans"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.103"
