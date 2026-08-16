@@ -201,6 +201,7 @@ fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args)
     let merged = merge::merge(
         &refs,
         args.merge_mask_features.then_some(masks.as_slice()),
+        args.merge_jobs,
     )?;
     if args.debug {
         log_merge_report(passes, &merged);
@@ -312,6 +313,10 @@ fn log_merge_report(passes: &[PathBuf], merged: &merge::Merged) {
         ""
     };
     elog!("  features{masked}");
+    elog!(
+        "  detection: {} pass(es) at a time",
+        report.detection_jobs
+    );
     elog!("  frame: reference {} (bundle adjusted)", name(report.reference));
     for (slot, &member) in merged.members.iter().enumerate() {
         let placement = report.transforms[slot];

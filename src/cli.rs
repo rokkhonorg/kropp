@@ -132,6 +132,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub merge_mask_features: bool,
 
+    /// How many passes to detect features on at once. Feature detection is the
+    /// slowest stage of a merge and also its memory high-water mark — several
+    /// gigabytes per pass at full platen resolution — so the default balances
+    /// the two rather than using every core. 0 picks it automatically.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub merge_jobs: usize,
+
     /// Write the merged image to this exact path instead of the default
     /// `<stem>_merged.<ext>`, and keep it. Only valid with a single merge
     /// group. Crops are still written next to it with `_<index>` suffixes.

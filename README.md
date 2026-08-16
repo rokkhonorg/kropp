@@ -80,6 +80,7 @@ kropp -i photo.jpg --alpha
 | `--merge-output` | `<stem>_merged` | Write the merged image to this exact path, and keep it |
 | `--keep-merged` | off | Keep the merged image next to the crops |
 | `--merge-mask-features` | off | Confine merge keypoints to the extracted foreground |
+| `--merge-jobs` | auto | How many passes to detect features on at once (see [Merge speed and memory](#merge-speed-and-memory)) |
 | `-t, --threshold` | `95` | Alpha cutoff %: below this is transparent, at/above is kept |
 | `-m, --min-area` | `0` | Drop objects smaller than this many pixels |
 | `--min-side-percent` | `10` | Drop objects whose longer side is under this % of the smaller image dimension |
@@ -181,7 +182,8 @@ blending joins them.
   the completed original.
 - **Bit depth is preserved.** 16-bit passes merge at 16 bits, end to end.
 - **The result is reproducible.** Feature matching and RANSAC are seeded, so
-  the same inputs always produce the same merge.
+  the same inputs always produce the same merge — including the number of
+  passes detected in parallel, which changes the timing and nothing else.
 
 Keypoints are taken from the whole pass by default. `--merge-mask-features`
 confines them to the extracted foreground, which keeps platen artifacts — bed
@@ -190,6 +192,23 @@ across passes — from matching each other into a false alignment. It is off by
 default because it also discards every keypoint the segmenter did not call
 foreground, which on a tight mask starves the fit, and it costs an extra
 extraction pass per input.
+
+### Merge speed and memory
+
+Feature detection dominates a merge — around three quarters of its time, far
+more than the alignment or the blending — and it is also the memory
+high-water mark, needing several gigabytes of scale space per pass at full
+platen resolution. Passes are therefore detected in parallel, but only as many
+at once as memory allows: kropp asks the OS how much is free, divides by what
+a pass of that size implies, and keeps a margin for everything else.
+
+On a four-pass group of 35-megapixel scans that works out at all four at once
+on a large machine, and one at a time on a small one. `--merge-jobs N` sets the
+count explicitly if you would rather decide yourself; `--debug` reports which
+count was chosen along with the per-stage timings.
+
+Raising it past what memory supports is counterproductive — swapping costs far
+more than the parallelism saves.
 
 ### Inspecting a merge
 
