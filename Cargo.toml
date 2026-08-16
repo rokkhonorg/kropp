@@ -21,6 +21,9 @@ imageproc = "0.27.0"
 tiff = "0.11.3"
 ort = { version = "=2.0.0-rc.10", features = ["fetch-models"] }
 usls = { version = "0.1.11", features = ["rmbg"] }
+zune-core = "0.5.3"
+zune-jpegxl = "0.5.2"
+sift-features = "0.1.0"
 
 # The CUDA and DirectML execution providers are Windows-specific here: DirectML
 # only ships Windows binaries, and these GPU features are gated to Windows so

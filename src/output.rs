@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Pixel, Rgb, Rgba};
 use imageproc::definitions::Clamp;
 use imageproc::geometric_transformations::{
@@ -13,24 +13,109 @@ use tiff::encoder::{
     Compression as TiffCompression, DeflateLevel, TiffEncoder as TiffImageEncoder,
     colortype::{RGB8 as TiffRgb8, RGB16 as TiffRgb16, RGBA8 as TiffRgba8, RGBA16 as TiffRgba16},
 };
+use zune_core::{bit_depth::BitDepth, colorspace::ColorSpace, options::EncoderOptions};
+use zune_jpegxl::JxlSimpleEncoder;
 
 use crate::components::{Object, crop_object, crop_object_rgba16};
 
 pub type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
 
+/// A format kropp can write. `image`'s `ImageFormat` covers everything except
+/// JPEG XL, which that crate cannot encode at all; those crops go through
+/// `zune-jpegxl` instead, so JXL needs its own variant here rather than an
+/// `ImageFormat` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Image(ImageFormat),
+    Jxl,
+}
+
+impl OutputFormat {
+    pub const PNG: Self = Self::Image(ImageFormat::Png);
+
+    /// Guess a format from a path extension, recognizing `.jxl` on top of
+    /// everything `image` knows.
+    fn from_path(path: &Path) -> Option<Self> {
+        let is_jxl = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jxl"));
+        if is_jxl {
+            return Some(Self::Jxl);
+        }
+        ImageFormat::from_path(path).ok().map(Self::Image)
+    }
+
+    fn preferred_extension(self) -> &'static str {
+        match self {
+            Self::Jxl => "jxl",
+            Self::Image(format) => format.extensions_str().first().copied().unwrap_or("png"),
+        }
+    }
+
+    /// Whether re-encoding to this format discards image data. These are the
+    /// lossy encoders `image` can write; everything else kropp supports is
+    /// lossless — including JPEG XL, since `zune-jpegxl` only encodes losslessly.
+    fn is_lossy(self) -> bool {
+        matches!(self, Self::Image(ImageFormat::Jpeg | ImageFormat::Avif))
+    }
+
+    fn supports_alpha(self) -> bool {
+        match self {
+            Self::Jxl => true,
+            Self::Image(format) => matches!(
+                format,
+                ImageFormat::Png
+                    | ImageFormat::Ico
+                    | ImageFormat::Tiff
+                    | ImageFormat::Tga
+                    | ImageFormat::Pnm
+                    | ImageFormat::Farbfeld
+                    | ImageFormat::Avif
+                    | ImageFormat::WebP
+                    | ImageFormat::OpenExr
+                    | ImageFormat::Qoi
+            ),
+        }
+    }
+
+    fn writing_enabled(self) -> bool {
+        match self {
+            Self::Jxl => true,
+            Self::Image(format) => format.writing_enabled(),
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jxl => write!(f, "JPEG XL"),
+            Self::Image(format) => write!(f, "{format:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputPlan {
     pub base: PathBuf,
-    pub format: ImageFormat,
+    pub format: OutputFormat,
 }
 
 impl OutputPlan {
+    /// `format_override` is `--format`: when set it wins over both the input's
+    /// format and `output`'s extension. When it is `None` the format is chosen
+    /// exactly as before — the `-o` extension if there is one, else the input's.
+    // These are the CLI's output-selection flags passed straight through; a
+    // params struct would just restate the argument list at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: &Path,
         output: Option<&str>,
         output_dir: Option<&str>,
         alpha: bool,
         allow_lossy: bool,
+        format_override: Option<OutputFormat>,
         input_format: ImageFormat,
         input_is_dir: bool,
     ) -> Result<Self> {
@@ -46,10 +131,11 @@ impl OutputPlan {
                     .file_name()
                     .context("directory inputs must have a file name")?,
             );
-            let format = resolve_format(&mut base, input_format, alpha, allow_lossy);
+            let requested_format = format_override.unwrap_or(OutputFormat::Image(input_format));
+            let format = resolve_format(&mut base, requested_format, alpha, allow_lossy);
 
             if !format.writing_enabled() {
-                bail!("output format {format:?} is not enabled for writing");
+                bail!("output format {format} is not enabled for writing");
             }
 
             return Ok(Self { base, format });
@@ -62,13 +148,15 @@ impl OutputPlan {
         let mut base = output
             .map(PathBuf::from)
             .unwrap_or_else(|| input.to_path_buf());
-        let requested_format = output
-            .and_then(|p| ImageFormat::from_path(p).ok())
-            .unwrap_or(input_format);
+        let requested_format = format_override.unwrap_or_else(|| {
+            output
+                .and_then(|p| OutputFormat::from_path(Path::new(p)))
+                .unwrap_or(OutputFormat::Image(input_format))
+        });
         let format = resolve_format(&mut base, requested_format, alpha, allow_lossy);
 
         if !format.writing_enabled() {
-            bail!("output format {format:?} is not enabled for writing");
+            bail!("output format {format} is not enabled for writing");
         }
 
         Ok(Self { base, format })
@@ -85,47 +173,30 @@ impl OutputPlan {
 /// likewise falls back to PNG when the chosen format has no alpha channel.
 fn resolve_format(
     base: &mut PathBuf,
-    mut format: ImageFormat,
+    mut format: OutputFormat,
     alpha: bool,
     allow_lossy: bool,
-) -> ImageFormat {
+) -> OutputFormat {
     // Redirect to PNG when alpha needs a channel the format lacks, or when a
     // lossy target would recompress the crop and the user hasn't opted in.
-    let needs_png =
-        (alpha && !format_supports_alpha(format)) || (!allow_lossy && is_lossy_format(format));
+    let needs_png = (alpha && !format.supports_alpha()) || (!allow_lossy && format.is_lossy());
     if needs_png {
-        format = ImageFormat::Png;
+        format = OutputFormat::PNG;
         base.set_extension("png");
-    } else if base.extension().is_none() {
-        base.set_extension(preferred_extension(format));
+    } else if base.extension().is_none() || extension_disagrees(base, format) {
+        base.set_extension(format.preferred_extension());
     }
     format
 }
 
-fn preferred_extension(format: ImageFormat) -> &'static str {
-    format.extensions_str().first().copied().unwrap_or("png")
-}
-
-/// Whether re-encoding to `format` discards image data. These are the lossy
-/// encoders `image` can write; everything else it supports is lossless.
-fn is_lossy_format(format: ImageFormat) -> bool {
-    matches!(format, ImageFormat::Jpeg | ImageFormat::Avif)
-}
-
-fn format_supports_alpha(format: ImageFormat) -> bool {
-    matches!(
-        format,
-        ImageFormat::Png
-            | ImageFormat::Ico
-            | ImageFormat::Tiff
-            | ImageFormat::Tga
-            | ImageFormat::Pnm
-            | ImageFormat::Farbfeld
-            | ImageFormat::Avif
-            | ImageFormat::WebP
-            | ImageFormat::OpenExr
-            | ImageFormat::Qoi
-    )
+/// Whether `base`'s extension names a known image format *other* than `format`.
+/// Without `--format` this never fires, since the format is derived from that
+/// very extension; an override is what makes them disagree (`-o out.png
+/// --format jxl`), and the extension has to follow the real encoder. An
+/// extension `image` doesn't recognize is left alone, as is one that already
+/// maps to `format`, so `.jpeg` is never rewritten to `.jpg`.
+fn extension_disagrees(base: &Path, format: OutputFormat) -> bool {
+    matches!(OutputFormat::from_path(base), Some(existing) if existing != format)
 }
 
 /// Insert `suffix` before the file extension of `path`.
@@ -186,7 +257,7 @@ pub fn write_rgb_output(
     theta: f32,
     quarter_turns: u8,
     path: &Path,
-    format: ImageFormat,
+    format: OutputFormat,
 ) -> Result<(u32, u32)> {
     match channel_depth(src)? {
         ChannelDepth::U8 => {
@@ -197,8 +268,11 @@ pub fn write_rgb_output(
             }
             let dims = img.dimensions();
             match format {
-                ImageFormat::Tiff => save_tiff_rgb8(path, &img)?,
-                _ => img
+                OutputFormat::Jxl => {
+                    save_jxl(path, img.as_raw(), dims, ColorSpace::RGB, BitDepth::Eight)?
+                }
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb8(path, &img)?,
+                OutputFormat::Image(format) => img
                     .save_with_format(path, format)
                     .with_context(|| format!("failed to write image: {}", path.display()))?,
             }
@@ -213,8 +287,15 @@ pub fn write_rgb_output(
             }
             let dims = img.dimensions();
             match format {
-                ImageFormat::Tiff => save_tiff_rgb16(path, &img)?,
-                _ => img
+                OutputFormat::Jxl => save_jxl(
+                    path,
+                    &to_native_endian_bytes(img.as_raw()),
+                    dims,
+                    ColorSpace::RGB,
+                    BitDepth::Sixteen,
+                )?,
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb16(path, &img)?,
+                OutputFormat::Image(format) => img
                     .save_with_format(path, format)
                     .with_context(|| format!("failed to write image: {}", path.display()))?,
             }
@@ -231,7 +312,7 @@ pub struct AlphaOutputRequest<'a> {
     pub quarter_turns: u8,
     pub crop_padding: f64,
     pub path: &'a Path,
-    pub format: ImageFormat,
+    pub format: OutputFormat,
 }
 
 pub fn write_alpha_output(src: &DynamicImage, req: AlphaOutputRequest<'_>) -> Result<(u32, u32)> {
@@ -256,9 +337,12 @@ pub fn write_alpha_output(src: &DynamicImage, req: AlphaOutputRequest<'_>) -> Re
             }
             let dims = img.dimensions();
             match req.format {
-                ImageFormat::Tiff => save_tiff_rgba8(req.path, &img)?,
-                _ => img
-                    .save_with_format(req.path, req.format)
+                OutputFormat::Jxl => {
+                    save_jxl(req.path, img.as_raw(), dims, ColorSpace::RGBA, BitDepth::Eight)?
+                }
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgba8(req.path, &img)?,
+                OutputFormat::Image(format) => img
+                    .save_with_format(req.path, format)
                     .with_context(|| format!("failed to write image: {}", req.path.display()))?,
             }
             Ok(dims)
@@ -283,14 +367,55 @@ pub fn write_alpha_output(src: &DynamicImage, req: AlphaOutputRequest<'_>) -> Re
             }
             let dims = img.dimensions();
             match req.format {
-                ImageFormat::Tiff => save_tiff_rgba16(req.path, &img)?,
-                _ => img
-                    .save_with_format(req.path, req.format)
+                OutputFormat::Jxl => save_jxl(
+                    req.path,
+                    &to_native_endian_bytes(img.as_raw()),
+                    dims,
+                    ColorSpace::RGBA,
+                    BitDepth::Sixteen,
+                )?,
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgba16(req.path, &img)?,
+                OutputFormat::Image(format) => img
+                    .save_with_format(req.path, format)
                     .with_context(|| format!("failed to write image: {}", req.path.display()))?,
             }
             Ok(dims)
         }
     }
+}
+
+/// Re-interpret 16-bit samples as the native-endian byte pairs `zune-jpegxl`
+/// expects; its encoder takes raw bytes and reads them back as `u16` in native
+/// order for `BitDepth::Sixteen`.
+fn to_native_endian_bytes(samples: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_ne_bytes());
+    }
+    bytes
+}
+
+/// Encode `data` as JPEG XL and write it to `path`. `zune-jpegxl` is a
+/// lossless-only encoder, so this never recompresses the crop — it is the same
+/// data PNG or TIFF would store, in a smaller container.
+fn save_jxl(
+    path: &Path,
+    data: &[u8],
+    (width, height): (u32, u32),
+    colorspace: ColorSpace,
+    depth: BitDepth,
+) -> Result<()> {
+    let options = EncoderOptions::new(width as usize, height as usize, colorspace, depth);
+    let mut encoded = Vec::new();
+    JxlSimpleEncoder::new(data, options)
+        .encode(&mut encoded)
+        // JxlEncodeErrors carries no source chain worth preserving, and going
+        // through Display keeps us off its std-only `Error` impl.
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("failed to encode JPEG XL: {}", path.display()))?;
+    std::fs::write(path, encoded)
+        .with_context(|| format!("failed to write image: {}", path.display()))?;
+    Ok(())
 }
 
 fn save_tiff_rgb8(path: &Path, img: &image::RgbImage) -> Result<()> {
@@ -603,13 +728,14 @@ mod tests {
             None,
             false,
             false,
+            None,
             ImageFormat::Jpeg,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(3), PathBuf::from("fixtures/photo_3.png"));
-        assert_eq!(plan.format, ImageFormat::Png);
+        assert_eq!(plan.format, OutputFormat::PNG);
     }
 
     #[test]
@@ -620,13 +746,14 @@ mod tests {
             None,
             false,
             true,
+            None,
             ImageFormat::Jpeg,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(3), PathBuf::from("fixtures/photo_3.jpeg"));
-        assert_eq!(plan.format, ImageFormat::Jpeg);
+        assert_eq!(plan.format, OutputFormat::Image(ImageFormat::Jpeg));
     }
 
     #[test]
@@ -637,13 +764,14 @@ mod tests {
             None,
             false,
             false,
+            None,
             ImageFormat::Tiff,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(0), PathBuf::from("scan_0.tiff"));
-        assert_eq!(plan.format, ImageFormat::Tiff);
+        assert_eq!(plan.format, OutputFormat::Image(ImageFormat::Tiff));
     }
 
     #[test]
@@ -654,13 +782,14 @@ mod tests {
             None,
             true,
             false,
+            None,
             ImageFormat::Jpeg,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(0), PathBuf::from("photo_0.png"));
-        assert_eq!(plan.format, ImageFormat::Png);
+        assert_eq!(plan.format, OutputFormat::PNG);
     }
 
     #[test]
@@ -671,13 +800,14 @@ mod tests {
             None,
             true,
             false,
+            None,
             ImageFormat::Tiff,
             false,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(0), PathBuf::from("photo_0.tiff"));
-        assert_eq!(plan.format, ImageFormat::Tiff);
+        assert_eq!(plan.format, OutputFormat::Image(ImageFormat::Tiff));
     }
 
     #[test]
@@ -688,6 +818,7 @@ mod tests {
             Some("out"),
             false,
             true,
+            None,
             ImageFormat::Jpeg,
             true,
         )
@@ -704,13 +835,197 @@ mod tests {
             Some("out"),
             false,
             false,
+            None,
             ImageFormat::Jpeg,
             true,
         )
         .unwrap();
 
         assert_eq!(plan.object_path(2), PathBuf::from("out/photo_2.png"));
-        assert_eq!(plan.format, ImageFormat::Png);
+        assert_eq!(plan.format, OutputFormat::PNG);
+    }
+
+    #[test]
+    fn format_override_beats_input_format_and_renames_extension() {
+        let plan = OutputPlan::new(
+            Path::new("scan.tiff"),
+            None,
+            None,
+            false,
+            false,
+            Some(OutputFormat::Jxl),
+            ImageFormat::Tiff,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(0), PathBuf::from("scan_0.jxl"));
+        assert_eq!(plan.format, OutputFormat::Jxl);
+    }
+
+    #[test]
+    fn format_override_beats_output_extension() {
+        let plan = OutputPlan::new(
+            Path::new("scan.tiff"),
+            Some("crops/out.png"),
+            None,
+            false,
+            false,
+            Some(OutputFormat::Jxl),
+            ImageFormat::Tiff,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(1), PathBuf::from("crops/out_1.jxl"));
+        assert_eq!(plan.format, OutputFormat::Jxl);
+    }
+
+    #[test]
+    fn format_override_applies_to_directory_inputs() {
+        let plan = OutputPlan::new(
+            Path::new("inputs/photo.jpg"),
+            None,
+            Some("out"),
+            false,
+            false,
+            Some(OutputFormat::Jxl),
+            ImageFormat::Jpeg,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(2), PathBuf::from("out/photo_2.jxl"));
+        assert_eq!(plan.format, OutputFormat::Jxl);
+    }
+
+    /// JPEG XL is lossless here, so --alpha must not divert it to PNG the way
+    /// an alpha-less format would.
+    #[test]
+    fn format_override_to_jxl_survives_alpha() {
+        let plan = OutputPlan::new(
+            Path::new("photo.jpg"),
+            None,
+            None,
+            true,
+            false,
+            Some(OutputFormat::Jxl),
+            ImageFormat::Jpeg,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(0), PathBuf::from("photo_0.jxl"));
+        assert_eq!(plan.format, OutputFormat::Jxl);
+    }
+
+    /// The lossy guard applies however the format was chosen, so an explicit
+    /// --format jpeg is still redirected without --allow-lossy-conversion.
+    #[test]
+    fn lossy_format_override_still_needs_allow_lossy() {
+        let plan = OutputPlan::new(
+            Path::new("scan.tiff"),
+            None,
+            None,
+            false,
+            false,
+            Some(OutputFormat::Image(ImageFormat::Jpeg)),
+            ImageFormat::Tiff,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.object_path(0), PathBuf::from("scan_0.png"));
+        assert_eq!(plan.format, OutputFormat::PNG);
+
+        let allowed = OutputPlan::new(
+            Path::new("scan.tiff"),
+            None,
+            None,
+            false,
+            true,
+            Some(OutputFormat::Image(ImageFormat::Jpeg)),
+            ImageFormat::Tiff,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(allowed.object_path(0), PathBuf::from("scan_0.jpg"));
+        assert_eq!(allowed.format, OutputFormat::Image(ImageFormat::Jpeg));
+    }
+
+    /// `zune-jpegxl` is encode-only, so there is no decoder here to round-trip
+    /// against; assert the writer produces a real JPEG XL stream instead of
+    /// silently putting some other container under a `.jxl` name.
+    fn assert_jxl_signature(bytes: &[u8]) {
+        assert!(!bytes.is_empty(), "encoder wrote no bytes");
+        assert!(
+            bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C]),
+            "not a JPEG XL stream: {:02X?}",
+            &bytes[..bytes.len().min(8)]
+        );
+    }
+
+    #[test]
+    fn jxl_rgb8_output_is_a_jxl_stream() {
+        let path = temp_image_path("jxl");
+        let mut src = image::RgbImage::new(8, 6);
+        for (x, y, px) in src.enumerate_pixels_mut() {
+            *px = Rgb([(x * 30) as u8, (y * 40) as u8, 200]);
+        }
+        let bounds = RotatedBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 8.0,
+            max_y: 6.0,
+        };
+
+        let dims = write_rgb_output(
+            &DynamicImage::ImageRgb8(src),
+            bounds,
+            0.0,
+            0,
+            &path,
+            OutputFormat::Jxl,
+        )
+        .unwrap();
+        assert_eq!(dims, (8, 6));
+
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_jxl_signature(&bytes);
+    }
+
+    /// The 16-bit path hands zune-jpegxl a re-interpreted byte buffer rather
+    /// than the sample slice, so it needs its own check that the length and
+    /// depth line up (a mismatch is an encoder error, not a silent bad file).
+    #[test]
+    fn jxl_rgb16_output_is_a_jxl_stream() {
+        let path = temp_image_path("jxl");
+        let mut src: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(8, 6);
+        for (x, y, px) in src.enumerate_pixels_mut() {
+            *px = Rgb([(x * 3000) as u16, (y * 4000) as u16, 40000]);
+        }
+        let bounds = RotatedBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 8.0,
+            max_y: 6.0,
+        };
+
+        write_rgb_output(
+            &DynamicImage::ImageRgb16(src),
+            bounds,
+            0.0,
+            0,
+            &path,
+            OutputFormat::Jxl,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_jxl_signature(&bytes);
     }
 
     #[test]
@@ -838,7 +1153,7 @@ mod tests {
             max_y: 1.0,
         };
 
-        write_rgb_output(&src, bounds, 0.0, 0, &path, ImageFormat::Png).unwrap();
+        write_rgb_output(&src, bounds, 0.0, 0, &path, OutputFormat::PNG).unwrap();
         let decoded = image::open(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
@@ -874,7 +1189,7 @@ mod tests {
                 quarter_turns: 0,
                 crop_padding: 0.0,
                 path: &path,
-                format: ImageFormat::Png,
+                format: OutputFormat::PNG,
             },
         )
         .unwrap();
@@ -913,7 +1228,7 @@ mod tests {
                 quarter_turns: 0,
                 crop_padding: 0.0,
                 path: &path,
-                format: ImageFormat::Tiff,
+                format: OutputFormat::Image(ImageFormat::Tiff),
             },
         )
         .unwrap();

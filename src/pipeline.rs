@@ -66,6 +66,14 @@ impl Pipeline {
         })
     }
 
+    /// Foreground mask for one image, row-major at that image's resolution and
+    /// `true` wherever any object was labelled. The merge stage uses this to
+    /// confine keypoints to the object.
+    pub fn extract_mask(&mut self, path: &str) -> Result<Vec<bool>> {
+        let extraction = self.extractor.extract(path)?;
+        Ok(extraction.labels.iter().map(|&label| label != 0).collect())
+    }
+
     /// Run inference on one source image, split it into objects, and write a
     /// crop per object. `model_input` is the path passed to the model reader;
     /// `summary_path`, when set, names the input in the final "found N" line

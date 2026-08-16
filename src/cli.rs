@@ -4,6 +4,37 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
+use image::ImageFormat;
+
+use crate::output::OutputFormat;
+
+/// Output format for `--format`, overriding the format kropp would otherwise
+/// infer. Only the formats that make sense for scan crops are offered; `jxl` is
+/// lossless JPEG XL, which `image` cannot write and kropp encodes itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormatArg {
+    Png,
+    Jpeg,
+    Tiff,
+    Webp,
+    Bmp,
+    Qoi,
+    Jxl,
+}
+
+impl OutputFormatArg {
+    pub fn to_output_format(self) -> OutputFormat {
+        match self {
+            Self::Png => OutputFormat::Image(ImageFormat::Png),
+            Self::Jpeg => OutputFormat::Image(ImageFormat::Jpeg),
+            Self::Tiff => OutputFormat::Image(ImageFormat::Tiff),
+            Self::Webp => OutputFormat::Image(ImageFormat::WebP),
+            Self::Bmp => OutputFormat::Image(ImageFormat::Bmp),
+            Self::Qoi => OutputFormat::Image(ImageFormat::Qoi),
+            Self::Jxl => OutputFormat::Jxl,
+        }
+    }
+}
 
 /// How the foreground objects are extracted from the scan before the crop and
 /// deskew stage.
@@ -72,6 +103,48 @@ pub struct Args {
     /// its own name and format under this directory.
     #[arg(long)]
     pub output_dir: Option<String>,
+
+    /// Merge several overlapping passes of one oversized original into a single
+    /// image before cropping. Accepts a list of files, or directories:
+    ///
+    ///   --merge-input a1.tif a2.tif      one group from these files
+    ///   --merge-input passes/            one group from that directory
+    ///   --merge-input left/ right/       two groups, one per directory
+    ///
+    /// When every argument is a directory each one is merged as its own group;
+    /// otherwise the whole list is a single group. The flag may be repeated and
+    /// its values accumulate. Passes must overlap; the merged result is
+    /// deskewed, uprighted, and cropped as one object.
+    #[arg(long = "merge-input", value_name = "PATHS", num_args = 1.., verbatim_doc_comment)]
+    pub merge_input: Vec<String>,
+
+    /// Keep the merged image alongside the crops, named `<stem>_merged.<ext>`.
+    /// Without this the merge is written to a temporary file and removed once
+    /// its crops have been produced.
+    #[arg(long, default_value_t = false)]
+    pub keep_merged: bool,
+
+    /// Confine merge keypoints to the extracted foreground, keeping platen
+    /// artifacts (bed edges, dust, lid shadow) out of the alignment. Off by
+    /// default: it also discards every keypoint the segmenter did not call
+    /// foreground, which on a tight mask starves the fit. Costs an extra
+    /// extraction pass per input.
+    #[arg(long, default_value_t = false)]
+    pub merge_mask_features: bool,
+
+    /// Write the merged image to this exact path instead of the default
+    /// `<stem>_merged.<ext>`, and keep it. Only valid with a single merge
+    /// group. Crops are still written next to it with `_<index>` suffixes.
+    #[arg(long, value_name = "PATH")]
+    pub merge_output: Option<String>,
+
+    /// Write every crop in this format instead of the one kropp infers, and
+    /// rename the output extension to match. Overrides both the input's format
+    /// and `-o`'s extension. `jxl` is lossless JPEG XL. A lossy choice
+    /// (`jpeg`) still needs --allow-lossy-conversion. Unset by default, which
+    /// leaves format selection exactly as it was.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub format: Option<OutputFormatArg>,
 
     /// Alpha threshold as a percentage: pixels below this become fully
     /// transparent, at or above become fully opaque.
@@ -282,6 +355,41 @@ mod tests {
             ]
         );
         assert!(args.input.is_none());
+    }
+
+    #[test]
+    fn merge_input_collects_several_paths() {
+        let args = Args::parse_from(["kropp", "--merge-input", "a1.tif", "a2.tif", "a3.tif"]);
+        assert_eq!(args.merge_input, vec!["a1.tif", "a2.tif", "a3.tif"]);
+    }
+
+    /// Repeating the flag accumulates rather than replacing, so a long group
+    /// can be split across several flags.
+    #[test]
+    fn merge_input_accumulates_across_occurrences() {
+        let args = Args::parse_from([
+            "kropp",
+            "--merge-input",
+            "a1.tif",
+            "--merge-input",
+            "a2.tif",
+        ]);
+        assert_eq!(args.merge_input, vec!["a1.tif", "a2.tif"]);
+    }
+
+    /// A merge-only run is a complete command; it must not require -i as well.
+    #[test]
+    fn merge_input_alone_parses_without_other_inputs() {
+        let args = Args::parse_from(["kropp", "--merge-input", "a.tif", "b.tif"]);
+        assert!(args.input.is_none());
+        assert!(args.paths.is_empty());
+        assert_eq!(args.merge_input.len(), 2);
+    }
+
+    #[test]
+    fn merged_output_is_discarded_unless_requested() {
+        assert!(!Args::parse_from(["kropp", "-i", "x"]).keep_merged);
+        assert!(Args::parse_from(["kropp", "-i", "x", "--keep-merged"]).keep_merged);
     }
 
     #[test]

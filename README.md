@@ -75,6 +75,9 @@ kropp -i photo.jpg --alpha
 | `--extractor` | `rmbg` | Foreground extractor: `rmbg`, `sam3-bg`, or `sam3-fg` (see [Extraction modes](#extraction-modes)) |
 | `-o, --output` | input name | Output path for a single input file |
 | `--output-dir` | — | Output directory (required when input is a directory) |
+| `--format` | inferred | Force the output format: `png`, `jpeg`, `tiff`, `webp`, `bmp`, `qoi`, `jxl` (see [Output format](#output-format)) |
+| `--merge-input` | — | Merge overlapping passes of one oversized original before cropping (see [Merging oversized originals](#merging-oversized-originals)) |
+| `--keep-merged` | off | Keep the merged image next to the crops |
 | `-t, --threshold` | `95` | Alpha cutoff %: below this is transparent, at/above is kept |
 | `-m, --min-area` | `0` | Drop objects smaller than this many pixels |
 | `--min-side-percent` | `10` | Drop objects whose longer side is under this % of the smaller image dimension |
@@ -100,6 +103,67 @@ kropp -i photo.jpg --allow-lossy-conversion   # -> photo_0.jpg
 
 An explicit `-o name.ext` still picks the format from its extension (and is
 itself redirected to PNG if lossy, unless `--allow-lossy-conversion` is set).
+
+### Forcing a format
+
+`--format` overrides all of the above and writes every crop in one format,
+renaming the output extension to match:
+
+```sh
+kropp ./inputs --output-dir ./outputs --format jxl   # -> outputs/<name>_0.jxl
+kropp -i scan.tiff -o crop.png --format jxl          # -> crop_0.jxl
+```
+
+Accepted values are `png`, `jpeg`, `tiff`, `webp`, `bmp`, `qoi`, and `jxl`.
+`jxl` is **lossless JPEG XL**, encoded with
+[`zune-jpegxl`](https://crates.io/crates/zune-jpegxl) in both 8- and 16-bit,
+with or without `--alpha`. It is a fast, simple modular encoder rather than a
+size-optimizing one, so it does not always beat PNG on file size — check
+against your own scans before switching a whole workflow to it. The lossy guard
+still applies to the override, so `--format jpeg` is redirected to PNG unless
+you also pass `--allow-lossy-conversion`.
+
+Note that JPEG XL is write-only here: kropp encodes `.jxl` but cannot read it,
+so `.jxl` files are not accepted as inputs.
+
+## Merging oversized originals
+
+An original too large for the platen can be scanned in several overlapping
+passes and merged before cropping:
+
+```sh
+kropp --merge-input poster_a.tif poster_b.tif        # one group from these files
+kropp --merge-input passes/                          # one group from a directory
+kropp --merge-input left/ right/ --output-dir out    # two groups, one per directory
+```
+
+When every argument is a directory each one is merged as its own group;
+otherwise the whole list is a single group. Add `--keep-merged` to keep the
+merged image (`<stem>_merged.<ext>`) alongside the crops.
+
+Passes must **overlap** — the alignment is driven by features found in the
+shared region, and a group whose passes don't overlap is reported rather than
+merged. A pass that overlaps nothing is left out with a warning while the rest
+proceed.
+
+How it works, and why it isn't OpenCV's stitcher:
+
+- **Alignment is a similarity, not a homography.** Flatbed passes are coplanar
+  and share a DPI, so scale is fixed at 1 and only rotation and translation are
+  solved. That makes the fit closed-form rather than an iterative bundle
+  adjustment.
+- **Keypoints are confined to the extracted object.** Platen artifacts — bed
+  edges, dust, lid shadow — sit at fixed scanner coordinates and are therefore
+  identical in every pass, which would match them together at zero
+  displacement. Masking removes them before they can vote.
+- **Passes are never individually deskewed.** They stay in a common frame
+  through the merge; deskew, orientation, and the final tight crop run once, on
+  the completed original.
+- **Bit depth is preserved.** 16-bit passes merge at 16 bits. OpenCV's
+  multi-band blender composites through *signed* 16-bit and clips everything
+  above 32767.
+- **The result is reproducible.** Feature matching and RANSAC are seeded, so
+  the same inputs always produce the same merge.
 
 ## Extraction modes
 

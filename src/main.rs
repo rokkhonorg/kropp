@@ -5,6 +5,7 @@ mod cli;
 mod components;
 mod debug_overlay;
 mod extract;
+mod merge;
 mod model;
 mod output;
 mod pipeline;
@@ -16,7 +17,7 @@ use clap::Parser;
 
 use crate::cli::Args;
 use crate::model::read_original_image;
-use crate::output::OutputPlan;
+use crate::output::{OutputPlan, suffixed_path};
 use crate::pipeline::{Pipeline, collect_input_paths, output_dir_has_prefix};
 
 fn main() {
@@ -54,27 +55,63 @@ fn run() -> Result<()> {
     }
 
     let cutoff = args.validate()?;
-    let inputs = resolve_inputs(&args)?;
+    // A run may merge groups, process ordinary inputs, or both. Only demand
+    // ordinary inputs when no merge group was given, so `--merge-input` alone
+    // is a complete command.
+    let merge_groups = resolve_merge_groups(&args.merge_input)?;
+    let merging = !merge_groups.is_empty();
+    let inputs = if merging {
+        resolve_optional_inputs(&args)?
+    } else {
+        resolve_inputs(&args)?
+    };
 
     // --output renames a single file's output; it can't address many inputs.
     if args.output.is_some() {
         if args.output_dir.is_some() {
             bail!("--output and --output-dir cannot be combined");
         }
-        if inputs.len() != 1 || !inputs[0].is_file() {
+        if merge_groups.len() > 1 {
+            bail!("--output cannot address several --merge-input groups; use --output-dir");
+        }
+        if !merging && (inputs.len() != 1 || !inputs[0].is_file()) {
             bail!(
                 "--output is only valid with a single image file; \
                  use --output-dir, or omit both to write next to each input"
             );
         }
     }
+    if args.merge_output.is_some() {
+        if merge_groups.is_empty() {
+            bail!("--merge-output is only meaningful with --merge-input");
+        }
+        if merge_groups.len() > 1 {
+            bail!(
+                "--merge-output names one file but {} merge groups were given; \
+                 use --output-dir instead",
+                merge_groups.len()
+            );
+        }
+    }
 
     // Build the extractor (and lazy classifiers) once and reuse across every input.
     let mut pipeline = Pipeline::new(&args, cutoff)?;
-    // With several inputs (e.g. dragging multiple files onto the exe) one bad
-    // file shouldn't abort the rest — report it and carry on. A single input
-    // stays fatal so its error surfaces directly.
-    let multi = inputs.len() > 1;
+
+    // Several units of work in one run: one failure shouldn't abort the rest.
+    // A lone unit stays fatal so its error surfaces directly.
+    let units = inputs.len() + merge_groups.len();
+    let multi = units > 1;
+
+    for group in &merge_groups {
+        if let Err(e) = process_merge_group(&mut pipeline, group, &args) {
+            if multi {
+                elog!("skipping merge group ({e:#})");
+            } else {
+                return Err(e);
+            }
+        }
+    }
+
     for input in &inputs {
         if let Err(e) = process_input(&mut pipeline, input, &args, multi) {
             if multi {
@@ -85,6 +122,256 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Inputs when a merge group is also present: the same resolution as
+/// `resolve_inputs`, except that having none is fine.
+fn resolve_optional_inputs(args: &Args) -> Result<Vec<PathBuf>> {
+    if args.paths.is_empty() && args.input.is_none() {
+        return Ok(Vec::new());
+    }
+    resolve_inputs(args)
+}
+
+/// Split `--merge-input` into the groups to merge.
+///
+/// Every argument being a directory means each directory is its own group,
+/// which is how a batch of separate originals is expressed. Any file present
+/// makes the whole list one group. Mixing the two is rejected rather than
+/// guessed at, since either reading would silently discard work.
+fn resolve_merge_groups(entries: &[String]) -> Result<Vec<Vec<PathBuf>>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let paths: Vec<PathBuf> = entries.iter().map(PathBuf::from).collect();
+    let directories = paths.iter().filter(|p| p.is_dir()).count();
+
+    if directories == paths.len() {
+        let mut groups = Vec::with_capacity(paths.len());
+        for directory in &paths {
+            let passes = collect_input_paths(directory)?;
+            if passes.len() < 2 {
+                bail!(
+                    "--merge-input {} holds {} image(s); a merge needs at least two",
+                    directory.display(),
+                    passes.len()
+                );
+            }
+            groups.push(passes);
+        }
+        return Ok(groups);
+    }
+
+    if directories > 0 {
+        bail!(
+            "--merge-input takes either a list of files (one group) or only \
+             directories (one group each), not a mix"
+        );
+    }
+    if paths.len() < 2 {
+        bail!("--merge-input needs at least two files, or a directory of them");
+    }
+    Ok(vec![paths])
+}
+
+/// Merge one group into a single image, then run the normal crop pipeline over
+/// it. The merged image is written to disk first because the extractor reads by
+/// path; `--keep-merged` decides whether that file outlives the run.
+fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args) -> Result<()> {
+    println!("merging {} passes", passes.len());
+
+    let mut images = Vec::with_capacity(passes.len());
+    let mut masks = Vec::with_capacity(passes.len());
+    let mut format = image::ImageFormat::Tiff;
+    for (idx, path) in passes.iter().enumerate() {
+        let (image, image_format) = read_original_image(path)?;
+        if idx == 0 {
+            format = image_format;
+        }
+        // Extraction is only needed when masking features, and it is a full
+        // model pass per input, so skip it otherwise.
+        if args.merge_mask_features {
+            let path_str = path.to_string_lossy();
+            masks.push(pipeline.extract_mask(&path_str)?);
+        }
+        images.push(image);
+    }
+
+    let refs: Vec<&image::DynamicImage> = images.iter().collect();
+    let merged = merge::merge(
+        &refs,
+        args.merge_mask_features.then_some(masks.as_slice()),
+    )?;
+    if args.debug {
+        log_merge_report(passes, &merged);
+    }
+
+    // A pass left out did not overlap the others confidently. That is nearly
+    // always a stray file in the group, so say so rather than failing.
+    if merged.members.len() != passes.len() {
+        for (idx, path) in passes.iter().enumerate() {
+            if !merged.members.contains(&idx) {
+                elog!(
+                    "warning: {} did not overlap the rest and was left out of the merge",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // The merge is lossless work; never hand it to a lossy encoder.
+    let merged_path = merged_output_path(&passes[0], args, format)?;
+    if let Some(parent) = merged_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    merged
+        .image
+        .save(&merged_path)
+        .with_context(|| format!("failed to write merged image: {}", merged_path.display()))?;
+    println!(
+        "merged -> {} ({}x{})",
+        merged_path.display(),
+        merged.image.width(),
+        merged.image.height()
+    );
+
+    // A picture of which pass supplied which region — far easier to judge than
+    // the numeric report, and the fastest way to spot a seam in a bad place.
+    if args.debug {
+        let overlay_path = suffixed_path(&merged_path, ".regions");
+        match merge::composite::ownership_overlay(&merged.image, &merged.ownership) {
+            Ok(overlay) => match overlay.save(&overlay_path) {
+                Ok(()) => println!("regions -> {}", overlay_path.display()),
+                Err(e) => elog!("could not write region overlay: {e}"),
+            },
+            Err(e) => elog!("could not build region overlay: {e:#}"),
+        }
+    }
+
+    let result = process_file(pipeline, &merged_path, args, false);
+    // Naming the merge explicitly is a request to keep it.
+    if !args.keep_merged && args.merge_output.is_none() {
+        let _ = std::fs::remove_file(&merged_path);
+    }
+    result
+}
+
+/// Report how the merge was arrived at, under `--debug`.
+///
+/// The column to read first is `resid`, the mean pixel error of each accepted
+/// fit. Under about a pixel the passes genuinely line up; several pixels means
+/// the alignment is a compromise and the blender is hiding it, which is where
+/// visible ghosting comes from if it shows at all.
+fn log_merge_report(passes: &[PathBuf], merged: &merge::Merged) {
+    let report = &merged.report;
+    let name = |index: usize| {
+        passes
+            .get(index)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("#{index}"))
+    };
+
+    elog!("merge report");
+    elog!("  passes:");
+    for (index, ((w, h), features)) in report.passes.iter().enumerate() {
+        elog!(
+            "    {:<28} {w}x{h}  {features} keypoints on the object",
+            name(index)
+        );
+    }
+
+    elog!("  pairwise fits:");
+    if report.fits.is_empty() {
+        elog!("    (none: no pair produced a transform)");
+    }
+    for fit in &report.fits {
+        let used = if fit.confidence >= merge::align::DEFAULT_CONFIDENCE_THRESHOLD {
+            "accepted"
+        } else {
+            "rejected"
+        };
+        elog!(
+            "    {} -> {}  {}/{} inliers  conf {:.2}  resid {:.2}px  \
+             dx {:+.1} dy {:+.1} rot {:+.3} deg  [{used}]",
+            name(fit.from),
+            name(fit.to),
+            fit.inliers,
+            fit.matches,
+            fit.confidence,
+            fit.residual,
+            fit.transform.tx,
+            fit.transform.ty,
+            fit.transform.theta.to_degrees(),
+        );
+    }
+
+    let masked = if report.masked_features {
+        " (confined to the extracted foreground)"
+    } else {
+        ""
+    };
+    elog!("  features{masked}");
+    elog!("  frame: reference {} (bundle adjusted)", name(report.reference));
+    for (slot, &member) in merged.members.iter().enumerate() {
+        let placement = report.transforms[slot];
+        elog!(
+            "    {:<28} at ({:+.1}, {:+.1}) rot {:+.3} deg scale {:.5}",
+            name(member),
+            placement.tx,
+            placement.ty,
+            placement.theta.to_degrees(),
+            placement.scale,
+        );
+    }
+
+    let (canvas_w, canvas_h) = report.canvas;
+    let input_area: u64 = report
+        .passes
+        .iter()
+        .map(|((w, h), _)| *w as u64 * *h as u64)
+        .sum();
+    elog!(
+        "  canvas: {canvas_w}x{canvas_h} ({:.0}% of the summed pass area — \
+         near 100% means little overlap was found)",
+        (canvas_w as f64 * canvas_h as f64) / input_area as f64 * 100.0
+    );
+    if report.levels <= 1 {
+        elog!("  blending: feather only (canvas too large for multi-band; expect ghosting)");
+    } else {
+        elog!("  blending: multi-band, {} bands", report.levels);
+    }
+}
+
+/// Where the merged image lands: next to the first pass (or under
+/// `--output-dir`), named after it with a `_merged` suffix. Lossy input formats
+/// are written as PNG so the merge is not recompressed.
+fn merged_output_path(
+    first_pass: &Path,
+    args: &Args,
+    format: image::ImageFormat,
+) -> Result<PathBuf> {
+    // An explicit --merge-output wins outright, extension and all.
+    if let Some(explicit) = &args.merge_output {
+        return Ok(PathBuf::from(explicit));
+    }
+
+    let stem = first_pass
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("merged");
+    let extension = match format {
+        image::ImageFormat::Jpeg | image::ImageFormat::Avif => "png",
+        other => other.extensions_str().first().copied().unwrap_or("png"),
+    };
+    let directory = match &args.output_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => first_pass
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    Ok(directory.join(format!("{stem}_merged.{extension}")))
 }
 
 /// Resolve the inputs to process: positional paths if any (the drag-and-drop
@@ -174,6 +461,7 @@ fn process_dir_file(
         Some(output_dir),
         args.alpha,
         args.allow_lossy_conversion,
+        args.format.map(|f| f.to_output_format()),
         input_format,
         true,
     )?;
@@ -201,6 +489,7 @@ fn process_file(pipeline: &mut Pipeline, input: &Path, args: &Args, label: bool)
                 Some(output_dir.as_str()),
                 args.alpha,
                 args.allow_lossy_conversion,
+                args.format.map(|f| f.to_output_format()),
                 input_format,
                 true,
             )?
@@ -211,6 +500,7 @@ fn process_file(pipeline: &mut Pipeline, input: &Path, args: &Args, label: bool)
             None,
             args.alpha,
             args.allow_lossy_conversion,
+            args.format.map(|f| f.to_output_format()),
             input_format,
             false,
         )?,
@@ -248,4 +538,142 @@ fn wait_for_enter() {
     let _ = write!(stdout, "\nPress Enter to exit...");
     let _ = stdout.flush();
     let _ = std::io::stdin().read(&mut [0u8]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kropp-merge-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        image::RgbImage::new(4, 4).save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn no_merge_input_yields_no_groups() {
+        assert!(resolve_merge_groups(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_list_of_files_is_one_group() {
+        let groups = resolve_merge_groups(&["a.tif".into(), "b.tif".into(), "c.tif".into()])
+            .unwrap();
+
+        assert_eq!(groups.len(), 1, "files should form a single group");
+        assert_eq!(groups[0].len(), 3);
+    }
+
+    #[test]
+    fn a_single_file_is_rejected() {
+        let err = resolve_merge_groups(&["only.tif".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least two files"), "got: {err}");
+    }
+
+    /// Directories are how a batch of separate originals is expressed, so each
+    /// becomes its own group rather than being pooled.
+    #[test]
+    fn each_directory_is_its_own_group() {
+        let root = scratch_dir("dirs");
+        let (left, right) = (root.join("left"), root.join("right"));
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        write_png(&left, "a.png");
+        write_png(&left, "b.png");
+        write_png(&right, "c.png");
+        write_png(&right, "d.png");
+
+        let groups = resolve_merge_groups(&[
+            left.to_string_lossy().into_owned(),
+            right.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(groups.len(), 2, "each directory should be its own group");
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_holding_one_image_is_rejected() {
+        let root = scratch_dir("lonely");
+        write_png(&root, "only.png");
+
+        let err = resolve_merge_groups(&[root.to_string_lossy().into_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs at least two"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Mixing a directory with loose files has two plausible readings and
+    /// either would quietly drop work, so it is refused instead of guessed.
+    #[test]
+    fn mixing_directories_and_files_is_refused() {
+        let root = scratch_dir("mixed");
+        write_png(&root, "a.png");
+        write_png(&root, "b.png");
+
+        let err = resolve_merge_groups(&[
+            root.to_string_lossy().into_owned(),
+            "loose.tif".into(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not a mix"), "got: {err}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn merged_path_sits_beside_the_first_pass_with_a_merged_suffix() {
+        let args = Args::parse_from(["kropp", "--merge-input", "a.tif", "b.tif"]);
+        let path =
+            merged_output_path(Path::new("scans/poster_0.tiff"), &args, image::ImageFormat::Tiff)
+                .unwrap();
+
+        assert_eq!(path, PathBuf::from("scans/poster_0_merged.tiff"));
+    }
+
+    /// The merge is lossless work; a JPEG source must not send it back through
+    /// a lossy encoder.
+    #[test]
+    fn merged_path_avoids_lossy_formats() {
+        let args = Args::parse_from(["kropp", "--merge-input", "a.jpg", "b.jpg"]);
+        let path = merged_output_path(Path::new("poster.jpg"), &args, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        assert_eq!(path, PathBuf::from("poster_merged.png"));
+    }
+
+    #[test]
+    fn merged_path_honours_output_dir() {
+        let args = Args::parse_from([
+            "kropp",
+            "--merge-input",
+            "a.tif",
+            "b.tif",
+            "--output-dir",
+            "out",
+        ]);
+        let path = merged_output_path(Path::new("scans/a.tif"), &args, image::ImageFormat::Tiff)
+            .unwrap();
+
+        assert_eq!(path, PathBuf::from("out/a_merged.tiff"));
+    }
 }
