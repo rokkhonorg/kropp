@@ -39,7 +39,9 @@ pub fn write_line(line: &str) {
 macro_rules! elog {
     ($($arg:tt)*) => {{
         let line = ::std::format!($($arg)*);
-        ::std::eprintln!("{}", line);
+        // Routed through `progress` so the status line is taken down and put
+        // back around this one, rather than being left stranded mid-way.
+        $crate::progress::emit_stderr(&line);
         $crate::logging::write_line(&line);
     }};
 }

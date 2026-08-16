@@ -1,5 +1,7 @@
 #[macro_use]
 mod logging;
+#[macro_use]
+mod progress;
 mod angle;
 mod cli;
 mod components;
@@ -178,23 +180,32 @@ fn resolve_merge_groups(entries: &[String]) -> Result<Vec<Vec<PathBuf>>> {
 /// it. The merged image is written to disk first because the extractor reads by
 /// path; `--keep-merged` decides whether that file outlives the run.
 fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args) -> Result<()> {
-    println!("merging {} passes", passes.len());
+    say!("merging {} passes", passes.len());
 
     let mut images = Vec::with_capacity(passes.len());
     let mut masks = Vec::with_capacity(passes.len());
     let mut format = image::ImageFormat::Tiff;
-    for (idx, path) in passes.iter().enumerate() {
-        let (image, image_format) = read_original_image(path)?;
-        if idx == 0 {
-            format = image_format;
+    {
+        let _stage = progress::stage("reading passes");
+        for (idx, path) in passes.iter().enumerate() {
+            progress::detail(format!(
+                "{}/{} {}",
+                idx + 1,
+                passes.len(),
+                path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+            ));
+            let (image, image_format) = read_original_image(path)?;
+            if idx == 0 {
+                format = image_format;
+            }
+            // Extraction is only needed when masking features, and it is a full
+            // model pass per input, so skip it otherwise.
+            if args.merge_mask_features {
+                let path_str = path.to_string_lossy();
+                masks.push(pipeline.extract_mask(&path_str)?);
+            }
+            images.push(image);
         }
-        // Extraction is only needed when masking features, and it is a full
-        // model pass per input, so skip it otherwise.
-        if args.merge_mask_features {
-            let path_str = path.to_string_lossy();
-            masks.push(pipeline.extract_mask(&path_str)?);
-        }
-        images.push(image);
     }
 
     let refs: Vec<&image::DynamicImage> = images.iter().collect();
@@ -225,11 +236,14 @@ fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args)
     if let Some(parent) = merged_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    merged
-        .image
-        .save(&merged_path)
-        .with_context(|| format!("failed to write merged image: {}", merged_path.display()))?;
-    println!(
+    {
+        let _stage = progress::stage("writing merged image");
+        merged
+            .image
+            .save(&merged_path)
+            .with_context(|| format!("failed to write merged image: {}", merged_path.display()))?;
+    }
+    say!(
         "merged -> {} ({}x{})",
         merged_path.display(),
         merged.image.width(),
@@ -240,9 +254,10 @@ fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args)
     // the numeric report, and the fastest way to spot a seam in a bad place.
     if args.debug {
         let overlay_path = suffixed_path(&merged_path, ".regions");
+        let _stage = progress::stage("writing region overlay");
         match merge::composite::ownership_overlay(&merged.image, &merged.ownership) {
             Ok(overlay) => match overlay.save(&overlay_path) {
-                Ok(()) => println!("regions -> {}", overlay_path.display()),
+                Ok(()) => say!("regions -> {}", overlay_path.display()),
                 Err(e) => elog!("could not write region overlay: {e}"),
             },
             Err(e) => elog!("could not build region overlay: {e:#}"),
@@ -370,7 +385,7 @@ fn log_merge_report(passes: &[PathBuf], merged: &merge::Merged) {
                 String::new()
             };
             elog!(
-                "    {label:<10} {:>7.2}s  {:>4.0}%{runs}",
+                "    {label:<20} {:>7.2}s  {:>4.0}%{runs}",
                 elapsed.as_secs_f64(),
                 elapsed.as_secs_f64() / whole * 100.0
             );
@@ -513,7 +528,17 @@ fn process_dir_file(
 /// Process a single input file. Output goes to `--output-dir` if set, else the
 /// explicit `--output`, else next to the input.
 fn process_file(pipeline: &mut Pipeline, input: &Path, args: &Args, label: bool) -> Result<()> {
-    let (src_original, input_format) = read_original_image(input)?;
+    let (src_original, input_format) = {
+        let _stage = progress::stage("reading image");
+        progress::detail(
+            input
+                .file_name()
+                .unwrap_or(input.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        );
+        read_original_image(input)?
+    };
     let output_plan = match &args.output_dir {
         Some(output_dir) => {
             std::fs::create_dir_all(output_dir)

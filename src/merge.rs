@@ -64,11 +64,15 @@ pub struct MergeReport {
 }
 
 /// Time `body`, push the result onto `into` under `label`, and return it.
+///
+/// The label doubles as the progress line's text, so a stage is named once and
+/// both the live status and the timing table agree about what ran.
 pub(crate) fn timed<T>(
     into: &mut Vec<(&'static str, std::time::Duration)>,
     label: &'static str,
     body: impl FnOnce() -> T,
 ) -> T {
+    let _stage = crate::progress::stage(label);
     let start = std::time::Instant::now();
     let value = body();
     into.push((label, start.elapsed()));
@@ -225,8 +229,30 @@ fn detect_all(
         }
     };
 
+    let total = passes.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    // Say how many run at once, or the counter looks stuck: with every pass in
+    // flight together they all finish at nearly the same moment, so it reads
+    // 0/4 for the whole stage and then jumps.
+    let concurrency = if jobs > 1 {
+        format!(" ({jobs} at a time)")
+    } else {
+        String::new()
+    };
+    let report = |done: &std::sync::atomic::AtomicUsize| {
+        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::progress::detail(format!("{finished}/{total} passes{concurrency}"));
+    };
+
+    crate::progress::detail(format!("0/{total} passes{concurrency}"));
     if jobs <= 1 {
-        return (0..passes.len()).map(detect_one).collect();
+        return (0..total)
+            .map(|index| {
+                let found = detect_one(index);
+                report(&done);
+                found
+            })
+            .collect();
     }
 
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -245,6 +271,7 @@ fn detect_all(
                     // Held only to hand over a finished result, never across
                     // the detection itself.
                     slots.lock().expect("detection slots")[index] = Some(found);
+                    report(&done);
                 }
             });
         }
@@ -291,9 +318,9 @@ pub fn merge(
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
     let jobs = detection_jobs(&sizes, jobs);
     let features: Vec<features::Features> =
-        timed(&mut timings, "detect", || detect_all(passes, masks, jobs));
+        timed(&mut timings, "detecting features", || detect_all(passes, masks, jobs));
 
-    let alignment = timed(&mut timings, "align", || {
+    let alignment = timed(&mut timings, "aligning passes", || {
         align::align_with_defaults(&features, &sizes)
     })?;
     let members: Vec<&DynamicImage> = alignment.members.iter().map(|&m| passes[m]).collect();

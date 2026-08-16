@@ -67,6 +67,24 @@ Cut the object out on a transparent background instead of a plain rectangle:
 kropp -i photo.jpg --alpha
 ```
 
+## Progress
+
+Long stages — reading and writing large scans, feature detection, blending —
+paint a live status line on stderr saying what is running, how far along it is,
+and how long it has been going:
+
+```
+  \ detecting features 2/4 passes (4 at a time) … 12s
+```
+
+It appears only when stderr is a terminal, so piping or redirecting gives
+exactly the same bytes it always did, and nothing is written to `--log-file`.
+Set `KROPP_PROGRESS=always` to force it on anyway (useful through `tee`, or in
+a CI log that renders carriage returns), or `KROPP_PROGRESS=never` to turn it
+off. Results and warnings scroll above the line as normal.
+
+For per-stage timings rather than a live line, use `--debug`.
+
 ## Common options
 
 | Option | Default | What it does |

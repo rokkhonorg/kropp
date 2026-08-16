@@ -611,14 +611,14 @@ fn composite_planes<P: Pass>(
 ) -> (Vec<Vec<f32>>, Vec<bool>, usize, Vec<u16>) {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
 
-    let (mut masks, coverage, mut ownership, per_pass) = super::timed(timings, "select", || {
+    let (mut masks, coverage, mut ownership, per_pass) = super::timed(timings, "choosing regions", || {
         selection_masks(places, passes, canvas_width, canvas_height)
     });
 
     // Geometry only decides where the boundary *starts*; the min cut moves it
     // onto pixels where the passes agree, which is what makes the regions
     // follow content instead of the layout.
-    let seam_stride = super::timed(timings, "seam", || {
+    let seam_stride = super::timed(timings, "placing seams", || {
         refine_seams(&mut ownership, places, passes, canvas_width, canvas_height)
     });
     for (index, mask) in masks.iter_mut().enumerate() {
@@ -628,7 +628,7 @@ fn composite_planes<P: Pass>(
         }
     }
     if let Some(stride) = seam_stride {
-        super::timed(timings, "soften", || {
+        super::timed(timings, "softening seams", || {
             soften_masks(&mut masks, &per_pass, canvas_width, canvas_height, stride)
         });
     }
@@ -656,13 +656,20 @@ fn composite_planes<P: Pass>(
     // Stream pass by pass: warp one, fold it into the bands, drop it. Only one
     // pass's planes and pyramids are live at a time.
     let mut blender = blend::Blender::<3>::new(width, height, levels);
-    for ((place, pass), mask) in places.iter().zip(passes).zip(&masks) {
-        let warped = super::timed(timings, "warp", || {
+    for (index, ((place, pass), mask)) in places.iter().zip(passes).zip(&masks).enumerate() {
+        // Set inside each stage, not before it: `timed` starts a fresh stage
+        // and a detail attached to the previous one would be wiped with it.
+        let progress = format!("pass {}/{}", index + 1, places.len());
+        let warped = super::timed(timings, "warping", || {
+            crate::progress::detail(progress.clone());
             warp_pass(place, canvas_width, canvas_height, pass)
         });
-        super::timed(timings, "blend", || blender.add_pass(warped, mask));
+        super::timed(timings, "blending", || {
+            crate::progress::detail(progress);
+            blender.add_pass(warped, mask)
+        });
     }
-    let planes = super::timed(timings, "collapse", || blender.finish()).to_vec();
+    let planes = super::timed(timings, "collapsing bands", || blender.finish()).to_vec();
 
     (planes, coverage, levels, ownership)
 }

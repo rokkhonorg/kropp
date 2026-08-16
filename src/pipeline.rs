@@ -70,6 +70,7 @@ impl Pipeline {
     /// `true` wherever any object was labelled. The merge stage uses this to
     /// confine keypoints to the object.
     pub fn extract_mask(&mut self, path: &str) -> Result<Vec<bool>> {
+        let _stage = crate::progress::stage("extracting foreground");
         let extraction = self.extractor.extract(path)?;
         Ok(extraction.labels.iter().map(|&label| label != 0).collect())
     }
@@ -94,7 +95,10 @@ impl Pipeline {
             height: h,
             labels,
             mut objects,
-        } = self.extractor.extract(model_input)?;
+        } = {
+            let _stage = crate::progress::stage("finding objects");
+            self.extractor.extract(model_input)?
+        };
 
         if src_original.dimensions() != (w, h) {
             bail!(
@@ -110,12 +114,14 @@ impl Pipeline {
         }
 
         for (idx, obj) in objects.iter().enumerate() {
+            let _stage = crate::progress::stage("cropping");
+            crate::progress::detail(format!("object {}/{}", idx + 1, objects.len()));
             self.process_object(idx, obj, &src, &labels, w, src_original, args, output_plan)?;
         }
 
         match summary_path {
-            Some(path) => println!("found {} object(s) in {}", objects.len(), path.display()),
-            None => println!("found {} object(s)", objects.len()),
+            Some(path) => say!("found {} object(s) in {}", objects.len(), path.display()),
+            None => say!("found {} object(s)", objects.len()),
         }
         Ok(())
     }
@@ -331,7 +337,7 @@ impl Pipeline {
         };
 
         let angle_note = angle_note(final_angle, source, text_est, quarter_turns);
-        println!(
+        say!(
             "wrote {} ({out_w}x{out_h}, {} px) angle {angle_note}",
             path.display(),
             obj.area
