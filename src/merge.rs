@@ -55,6 +55,22 @@ pub struct MergeReport {
     pub levels: usize,
     /// Whether keypoints were confined to the foreground mask.
     pub masked_features: bool,
+    /// Wall-clock per stage, in the order they ran. Printed under `--debug`;
+    /// the only way to tell which stage a slow merge is actually spending its
+    /// time in, since the costs are wildly uneven and not where you would guess.
+    pub timings: Vec<(&'static str, std::time::Duration)>,
+}
+
+/// Time `body`, push the result onto `into` under `label`, and return it.
+pub(crate) fn timed<T>(
+    into: &mut Vec<(&'static str, std::time::Duration)>,
+    label: &'static str,
+    body: impl FnOnce() -> T,
+) -> T {
+    let start = std::time::Instant::now();
+    let value = body();
+    into.push((label, start.elapsed()));
+    value
 }
 
 /// A completed merge.
@@ -93,21 +109,26 @@ pub fn merge(passes: &[&DynamicImage], masks: Option<&[Vec<bool>]>) -> Result<Me
         bail!("expected one mask per pass");
     }
 
+    let mut timings = Vec::new();
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
-    let features: Vec<features::Features> = passes
-        .iter()
-        .enumerate()
-        .map(|(index, pass)| {
-            let luma = features::detection_luma(pass);
-            let limit = Some(features::feature_limit(pass.width(), pass.height()));
-            match masks {
-                Some(masks) => features::detect_masked(&luma, &masks[index], limit),
-                None => features::detect(&luma, limit),
-            }
-        })
-        .collect();
+    let features: Vec<features::Features> = timed(&mut timings, "detect", || {
+        passes
+            .iter()
+            .enumerate()
+            .map(|(index, pass)| {
+                let luma = features::detection_luma(pass);
+                let limit = Some(features::feature_limit(pass.width(), pass.height()));
+                match masks {
+                    Some(masks) => features::detect_masked(&luma, &masks[index], limit),
+                    None => features::detect(&luma, limit),
+                }
+            })
+            .collect()
+    });
 
-    let alignment = align::align_with_defaults(&features, &sizes)?;
+    let alignment = timed(&mut timings, "align", || {
+        align::align_with_defaults(&features, &sizes)
+    })?;
     let members: Vec<&DynamicImage> = alignment.members.iter().map(|&m| passes[m]).collect();
     let composed = composite::composite(
         &members,
@@ -115,6 +136,7 @@ pub fn merge(passes: &[&DynamicImage], masks: Option<&[Vec<bool>]>) -> Result<Me
         alignment.canvas_width,
         alignment.canvas_height,
         composite::DEFAULT_FEATHER,
+        &mut timings,
     )?;
 
     Ok(Merged {
@@ -132,6 +154,7 @@ pub fn merge(passes: &[&DynamicImage], masks: Option<&[Vec<bool>]>) -> Result<Me
             canvas: (alignment.canvas_width, alignment.canvas_height),
             levels: composed.levels,
             masked_features: masks.is_some(),
+            timings,
         },
         members: alignment.members,
     })

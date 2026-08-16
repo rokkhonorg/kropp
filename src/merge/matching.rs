@@ -82,57 +82,93 @@ fn descriptor_distance_sq(a: &Descriptor, b: &Descriptor) -> u32 {
     total
 }
 
-/// Best and second-best match for `query` over `haystack`, by squared
-/// distance. Returns `None` when there are fewer than two candidates, since the
-/// ratio test needs a runner-up to compare against.
-fn two_nearest(query: &Descriptor, haystack: &[Descriptor]) -> Option<(usize, u32, u32)> {
-    if haystack.len() < 2 {
-        return None;
-    }
-    let (mut best_idx, mut best, mut second) = (0usize, u32::MAX, u32::MAX);
-    for (idx, candidate) in haystack.iter().enumerate() {
-        let dist = descriptor_distance_sq(query, candidate);
-        if dist < best {
-            second = best;
-            best = dist;
-            best_idx = idx;
-        } else if dist < second {
-            second = dist;
-        }
-    }
-    Some((best_idx, best, second))
+/// Running best and second-best distance seen, and which candidate was best.
+///
+/// Ties keep the earlier candidate, which is what makes the matcher's output a
+/// deterministic function of descriptor order.
+#[derive(Clone, Copy)]
+struct Nearest {
+    index: usize,
+    best: u32,
+    second: u32,
 }
 
-/// One direction of the ratio test. `d0 < (1 - match_conf) * d1`, on squared
-/// distances, so the ratio is squared too.
-fn ratio_matches(from: &[Descriptor], to: &[Descriptor], match_conf: f32) -> Vec<Match> {
-    let ratio = (1.0 - match_conf as f64).max(0.0);
-    let ratio_sq = ratio * ratio;
-    let mut matches = Vec::new();
-    for (idx, query) in from.iter().enumerate() {
-        let Some((best_idx, best, second)) = two_nearest(query, to) else {
-            continue;
-        };
-        if (best as f64) < ratio_sq * second as f64 {
-            matches.push(Match {
-                from: idx,
-                to: best_idx,
-            });
+impl Nearest {
+    const EMPTY: Self = Self {
+        index: 0,
+        best: u32::MAX,
+        second: u32::MAX,
+    };
+
+    #[inline]
+    fn offer(&mut self, index: usize, distance: u32) {
+        if distance < self.best {
+            self.second = self.best;
+            self.best = distance;
+            self.index = index;
+        } else if distance < self.second {
+            self.second = distance;
         }
     }
-    matches
+
+    /// Lowe's ratio test, `d0 < (1 - match_conf) * d1`, on squared distances so
+    /// the ratio is squared too. `candidates` is how many were on offer: with
+    /// fewer than two there is no runner-up to compare against.
+    fn accepts(&self, ratio_sq: f64, candidates: usize) -> bool {
+        candidates >= 2 && (self.best as f64) < ratio_sq * self.second as f64
+    }
 }
 
 /// Two-way descriptor matching, mirroring `BestOf2NearestMatcher`: run the
 /// ratio test in both directions and take the **union**, dropping any reversed
 /// pair already present. Brute force is intentional — a few hundred features
 /// over a handful of passes does not justify an index.
+///
+/// Both directions are resolved in a single sweep of the cross product. The
+/// distance between two descriptors is the same whichever way round it is
+/// asked, so scanning once and keeping a running top-2 per row *and* per column
+/// gets both answers for the price of one — the previous form computed every
+/// distance twice.
 pub fn match_descriptors(from: &[Descriptor], to: &[Descriptor], match_conf: f32) -> Vec<Match> {
-    let mut matches = ratio_matches(from, to, match_conf);
-    for reverse in ratio_matches(to, from, match_conf) {
+    let ratio = (1.0 - match_conf as f64).max(0.0);
+    let ratio_sq = ratio * ratio;
+
+    let mut rows = vec![Nearest::EMPTY; from.len()];
+
+    let mut columns = vec![Nearest::EMPTY; to.len()];
+
+    for (i, query) in from.iter().enumerate() {
+        // Kept in a local so the hot loop is not writing through `rows` on
+        // every candidate.
+        let mut row = Nearest::EMPTY;
+        for (j, candidate) in to.iter().enumerate() {
+            let distance = descriptor_distance_sq(query, candidate);
+            row.offer(j, distance);
+            columns[j].offer(i, distance);
+        }
+        rows[i] = row;
+    }
+
+    // Forward direction first, in `from` order.
+    let mut matches: Vec<Match> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.accepts(ratio_sq, to.len()))
+        .map(|(i, row)| Match {
+            from: i,
+            to: row.index,
+        })
+        .collect();
+
+    // Then the reverse, in `to` order, flipped back into `from -> to` and
+    // deduplicated against what the forward pass already claimed.
+    for (j, column) in columns.iter().enumerate() {
+        if !column.accepts(ratio_sq, from.len()) {
+            continue;
+        }
         let flipped = Match {
-            from: reverse.to,
-            to: reverse.from,
+            from: column.index,
+            to: j,
         };
         if !matches.contains(&flipped) {
             matches.push(flipped);
@@ -312,24 +348,81 @@ mod tests {
         assert_eq!(seen.len(), matches.len(), "duplicate pairs in union");
     }
 
+    /// A one-descriptor query set exercises the forward direction alone: the
+    /// reverse needs two queries of its own to have a runner-up, so it
+    /// contributes nothing and cannot mask the result.
     #[test]
     fn ratio_test_rejects_ambiguous_matches() {
         // Two near-identical candidates make the best/second ratio ~1, which
         // the strict SIFT threshold must reject.
         let query = vec![descriptor(100, 0)];
         let ambiguous = vec![descriptor(101, 0), descriptor(102, 0)];
-        assert!(ratio_matches(&query, &ambiguous, DEFAULT_MATCH_CONF).is_empty());
+        assert!(match_descriptors(&query, &ambiguous, DEFAULT_MATCH_CONF).is_empty());
 
         // A clear winner passes.
         let distinct = vec![descriptor(100, 0), descriptor(255, 200)];
-        assert_eq!(ratio_matches(&query, &distinct, DEFAULT_MATCH_CONF).len(), 1);
+        assert_eq!(
+            match_descriptors(&query, &distinct, DEFAULT_MATCH_CONF).len(),
+            1
+        );
     }
 
     #[test]
     fn single_candidate_cannot_pass_ratio_test() {
         let query = vec![descriptor(10, 0)];
         let only_one = vec![descriptor(10, 0)];
-        assert!(ratio_matches(&query, &only_one, DEFAULT_MATCH_CONF).is_empty());
+        assert!(match_descriptors(&query, &only_one, DEFAULT_MATCH_CONF).is_empty());
+    }
+
+    /// The fused two-way sweep must agree with the obvious separate-directions
+    /// implementation, including the order it emits pairs in — RANSAC samples
+    /// by index, so a reordering is a behaviour change, not a cosmetic one.
+    #[test]
+    fn fused_matching_agrees_with_separate_directions() {
+        let one: Vec<Descriptor> = (0..12).map(|i| descriptor(i as u8 * 17, i as u8)).collect();
+        let two: Vec<Descriptor> = (0..9)
+            .map(|i| descriptor(i as u8 * 17 + 3, i as u8 * 2))
+            .collect();
+
+        // The straightforward version: full top-2 scan, once per direction.
+        let naive = |from: &[Descriptor], to: &[Descriptor]| -> Vec<Match> {
+            let ratio = (1.0 - DEFAULT_MATCH_CONF as f64).max(0.0);
+            let ratio_sq = ratio * ratio;
+            let mut out = Vec::new();
+            for (i, query) in from.iter().enumerate() {
+                if to.len() < 2 {
+                    continue;
+                }
+                let (mut index, mut best, mut second) = (0usize, u32::MAX, u32::MAX);
+                for (j, candidate) in to.iter().enumerate() {
+                    let d = descriptor_distance_sq(query, candidate);
+                    if d < best {
+                        second = best;
+                        best = d;
+                        index = j;
+                    } else if d < second {
+                        second = d;
+                    }
+                }
+                if (best as f64) < ratio_sq * second as f64 {
+                    out.push(Match { from: i, to: index });
+                }
+            }
+            out
+        };
+
+        let mut expected = naive(&one, &two);
+        for reverse in naive(&two, &one) {
+            let flipped = Match {
+                from: reverse.to,
+                to: reverse.from,
+            };
+            if !expected.contains(&flipped) {
+                expected.push(flipped);
+            }
+        }
+
+        assert_eq!(match_descriptors(&one, &two, DEFAULT_MATCH_CONF), expected);
     }
 
     fn shifted(points: &[Point], t: Similarity) -> Vec<(Point, Point)> {

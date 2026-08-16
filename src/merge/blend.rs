@@ -23,28 +23,59 @@ fn clamp_index(value: isize, limit: usize) -> usize {
 }
 
 /// Separable 5-tap blur.
+///
+/// The clamp-to-edge only bites within two pixels of a border, which on a
+/// megapixel plane is a vanishing fraction of the work — so each axis is split
+/// into borders, handled with the general clamped form, and an interior where
+/// the five taps are known to be in range and can be read straight off. This is
+/// the innermost loop of the whole merge: every pyramid level of every mask and
+/// every channel of every pass passes through it twice.
 fn blur(src: &[f32], w: usize, h: usize) -> Vec<f32> {
+    // Horizontal pass.
     let mut horizontal = vec![0.0f32; w * h];
+    // Where the taps `x-2 ..= x+2` are all in range.
+    let interior = 2..w.saturating_sub(2);
     for y in 0..h {
-        for x in 0..w {
+        let row = &src[y * w..y * w + w];
+        let out = &mut horizontal[y * w..y * w + w];
+
+        for x in (0..w).take(2).chain(interior.end.max(2)..w) {
             let mut total = 0.0;
             for (tap, weight) in KERNEL.iter().enumerate() {
-                let sx = clamp_index(x as isize + tap as isize - 2, w);
-                total += src[y * w + sx] * weight;
+                total += row[clamp_index(x as isize + tap as isize - 2, w)] * weight;
             }
-            horizontal[y * w + x] = total;
+            out[x] = total;
+        }
+        for x in interior.clone() {
+            out[x] = row[x - 2] * KERNEL[0]
+                + row[x - 1] * KERNEL[1]
+                + row[x] * KERNEL[2]
+                + row[x + 1] * KERNEL[3]
+                + row[x + 2] * KERNEL[4];
         }
     }
 
+    // Vertical pass. The five source rows are resolved once per output row
+    // rather than once per pixel, so the inner loop is five flat slice reads.
     let mut out = vec![0.0f32; w * h];
     for y in 0..h {
+        let rows: [usize; 5] = std::array::from_fn(|tap| {
+            clamp_index(y as isize + tap as isize - 2, h) * w
+        });
+        let (r0, r1, r2, r3, r4) = (
+            &horizontal[rows[0]..rows[0] + w],
+            &horizontal[rows[1]..rows[1] + w],
+            &horizontal[rows[2]..rows[2] + w],
+            &horizontal[rows[3]..rows[3] + w],
+            &horizontal[rows[4]..rows[4] + w],
+        );
+        let dst = &mut out[y * w..y * w + w];
         for x in 0..w {
-            let mut total = 0.0;
-            for (tap, weight) in KERNEL.iter().enumerate() {
-                let sy = clamp_index(y as isize + tap as isize - 2, h);
-                total += horizontal[sy * w + x] * weight;
-            }
-            out[y * w + x] = total;
+            dst[x] = r0[x] * KERNEL[0]
+                + r1[x] * KERNEL[1]
+                + r2[x] * KERNEL[2]
+                + r3[x] * KERNEL[3]
+                + r4[x] * KERNEL[4];
         }
     }
     out
@@ -119,10 +150,12 @@ pub fn level_count(width: usize, height: usize, strength: f64) -> usize {
     from_width.min(from_size).max(1)
 }
 
-/// Gaussian pyramid of `src`, `levels` deep.
-fn gaussian_pyramid(src: &[f32], width: usize, height: usize, levels: usize) -> Vec<Vec<f32>> {
+/// Gaussian pyramid of `src`, `levels` deep. Takes ownership so the base level
+/// is moved in rather than copied — at canvas scale that copy is hundreds of
+/// megabytes, and it would happen once per channel per pass.
+fn gaussian_pyramid(src: Vec<f32>, width: usize, height: usize, levels: usize) -> Vec<Vec<f32>> {
     let mut pyramid = Vec::with_capacity(levels);
-    let (mut current, mut w, mut h) = (src.to_vec(), width, height);
+    let (mut current, mut w, mut h) = (src, width, height);
     for level in 0..levels {
         if level + 1 == levels {
             pyramid.push(current);
@@ -159,42 +192,9 @@ fn laplacian_pyramid(gaussian: &[Vec<f32>], sizes: &[(usize, usize)]) -> Vec<Vec
     pyramid
 }
 
-/// Multi-band blend of one channel.
-///
-/// `planes` holds each pass's canvas-sized channel; `masks` holds each pass's
-/// selection weight, which must sum to 1 at every covered pixel (a binary
-/// argmax mask satisfies this). Because blurring is linear, masks that sum to 1
-/// keep summing to 1 at every level, so no per-level renormalization is needed.
-///
-/// Returns the blended channel at canvas size.
-pub fn blend_channel(
-    planes: &[Vec<f32>],
-    masks: &[Vec<f32>],
-    width: usize,
-    height: usize,
-    levels: usize,
-) -> Vec<f32> {
-    let sizes = level_sizes(width, height, levels);
-    let mut accumulated: Vec<Vec<f32>> = sizes.iter().map(|&(w, h)| vec![0.0f32; w * h]).collect();
-
-    for (plane, mask) in planes.iter().zip(masks) {
-        let plane_gaussian = gaussian_pyramid(plane, width, height, levels);
-        let plane_laplacian = laplacian_pyramid(&plane_gaussian, &sizes);
-        drop(plane_gaussian);
-        let mask_gaussian = gaussian_pyramid(mask, width, height, levels);
-
-        for level in 0..levels {
-            let target = &mut accumulated[level];
-            for (slot, (detail, weight)) in target
-                .iter_mut()
-                .zip(plane_laplacian[level].iter().zip(&mask_gaussian[level]))
-            {
-                *slot += detail * weight;
-            }
-        }
-    }
-
-    // Collapse from the coarsest level upward.
+/// Collapse a band accumulator from its coarsest level upward.
+fn collapse(mut accumulated: Vec<Vec<f32>>, sizes: &[(usize, usize)]) -> Vec<f32> {
+    let levels = accumulated.len();
     let mut result = accumulated.pop().expect("at least one level");
     for level in (0..levels - 1).rev() {
         let (w, h) = sizes[level];
@@ -207,6 +207,80 @@ pub fn blend_channel(
             .collect();
     }
     result
+}
+
+/// Multi-band blend of `C` co-registered channels, accumulated one pass at a
+/// time.
+///
+/// Streaming rather than taking every pass at once is what keeps this
+/// affordable. A pass contributes to the bands and is then done with, so only
+/// one pass's planes and pyramids are ever live — against every pass's, which
+/// at canvas scale is gigabytes.
+///
+/// It also removes the reason the mask pyramid used to be rebuilt per channel.
+/// The selection mask does not vary with colour, and its pyramid costs as much
+/// as a plane's, so blending channel by channel threw away two thirds of that
+/// work. Here it is built once per pass and shared.
+///
+/// Masks must sum to 1 at every covered pixel (a binary argmax mask satisfies
+/// this). Because blurring is linear, masks that sum to 1 keep summing to 1 at
+/// every level, so no per-level renormalization is needed.
+pub struct Blender<const C: usize> {
+    sizes: Vec<(usize, usize)>,
+    levels: usize,
+    /// Per channel, then per level.
+    accumulated: [Vec<Vec<f32>>; C],
+}
+
+impl<const C: usize> Blender<C> {
+    pub fn new(width: usize, height: usize, levels: usize) -> Self {
+        let sizes = level_sizes(width, height, levels);
+        let accumulated =
+            std::array::from_fn(|_| sizes.iter().map(|&(w, h)| vec![0.0f32; w * h]).collect());
+        Self {
+            sizes,
+            levels,
+            accumulated,
+        }
+    }
+
+    /// Fold one pass in: its `C` canvas-sized channels, weighted by `mask`.
+    pub fn add_pass(&mut self, planes: [Vec<f32>; C], mask: &[f32]) {
+        let (width, height) = self.sizes[0];
+        // Built once and shared by every channel — the point of streaming.
+        let mask_gaussian = gaussian_pyramid(mask.to_vec(), width, height, self.levels);
+
+        for (channel, plane) in planes.into_iter().enumerate() {
+            let gaussian = gaussian_pyramid(plane, width, height, self.levels);
+            let laplacian = laplacian_pyramid(&gaussian, &self.sizes);
+            drop(gaussian);
+
+            for level in 0..self.levels {
+                let target = &mut self.accumulated[channel][level];
+                for (slot, (detail, weight)) in target
+                    .iter_mut()
+                    .zip(laplacian[level].iter().zip(&mask_gaussian[level]))
+                {
+                    *slot += detail * weight;
+                }
+            }
+        }
+    }
+
+    /// Collapse every channel's bands back to canvas size.
+    pub fn finish(self) -> [Vec<f32>; C] {
+        let Self {
+            sizes, accumulated, ..
+        } = self;
+        let mut channels = accumulated.into_iter();
+        // `from_fn` runs 0..C in order, matching the accumulator order.
+        std::array::from_fn(|_| {
+            collapse(
+                channels.next().expect("one accumulator per channel"),
+                &sizes,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +326,7 @@ mod tests {
         let levels = 4;
         let sizes = level_sizes(w, h, levels);
 
-        let gaussian = gaussian_pyramid(&src, w, h, levels);
+        let gaussian = gaussian_pyramid(src.clone(), w, h, levels);
         let laplacian = laplacian_pyramid(&gaussian, &sizes);
 
         let mut result = laplacian[levels - 1].clone();
@@ -283,13 +357,9 @@ mod tests {
         let plane: Vec<f32> = (0..w * h).map(|i| (i % 23) as f32 * 5.0).collect();
         let mask = vec![1.0f32; w * h];
 
-        let blended = blend_channel(
-            std::slice::from_ref(&plane),
-            std::slice::from_ref(&mask),
-            w,
-            h,
-            4,
-        );
+        let mut blender = Blender::<1>::new(w, h, 4);
+        blender.add_pass([plane.clone()], &mask);
+        let [blended] = blender.finish();
 
         for (original, result) in plane.iter().zip(&blended) {
             assert!(
@@ -326,9 +396,10 @@ mod tests {
             }
         }
 
-        let planes = vec![left.clone(), right.clone()];
-        let masks = vec![mask_left, mask_right];
-        let blended = blend_channel(&planes, &masks, w, h, 4);
+        let mut blender = Blender::<1>::new(w, h, 4);
+        blender.add_pass([left.clone()], &mask_left);
+        blender.add_pass([right.clone()], &mask_right);
+        let [blended] = blender.finish();
 
         // Contrast across the middle rows, measured as mean absolute
         // neighbour difference. A 50/50 average of the two offset patterns is

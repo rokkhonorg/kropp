@@ -1,15 +1,16 @@
 //! Warp the aligned passes onto one canvas and blend them together.
 //!
-//! Each canvas pixel is claimed outright by whichever pass is furthest from its
-//! own border, which puts a hard seam down the centre of the overlap — no
-//! max-flow, no graph cut. `blend` then softens that seam per frequency band,
-//! so the selection stays sharp where sharpness matters.
+//! Each canvas pixel starts out claimed by whichever pass is furthest from its
+//! own border; `seam` then moves the boundary between every overlapping pair
+//! onto pixels where the two already agree, and `blend` softens what is left
+//! per frequency band, so the selection stays sharp where sharpness matters.
 //!
 //! Three properties this stage is built around:
 //!
-//! * **One resample.** A single inverse-mapped bilinear fetch per output pixel,
-//!   from the original pass. The alignment transform is already composed, so
-//!   nothing is resampled twice.
+//! * **One resample.** A single inverse-mapped bilinear fetch per pass per
+//!   output pixel, from the original pass, yielding all three channels at once.
+//!   The alignment transform is already composed, so nothing is resampled
+//!   twice.
 //! * **Multi-band blending.** A plain weighted average across the overlap
 //!   ghosts whenever the alignment is off by even a pixel, and on real scans it
 //!   always is. Blending per frequency band keeps fine detail coming from one
@@ -25,9 +26,30 @@ use super::blend;
 use super::geometry::Similarity;
 use super::seam;
 
-/// Fetches an RGB sample from one pass at a source coordinate, or `None`
-/// outside it. Boxed so both depths share the compositing core.
-type Sampler<'a> = Box<dyn Fn(f64, f64) -> Option<[f32; 3]> + 'a>;
+/// One input pass, as the compositing core sees it: something that yields an
+/// RGB sample at a source coordinate, or `None` outside itself.
+///
+/// A trait rather than a boxed closure so the core monomorphizes per depth.
+/// Sampling happens hundreds of millions of times per merge, and through
+/// `dyn Fn` every one of those was an indirect call the bilinear arithmetic
+/// could not be inlined into.
+pub trait Pass {
+    fn sample(&self, x: f64, y: f64) -> Option<[f32; 3]>;
+}
+
+impl Pass for RgbImage {
+    #[inline]
+    fn sample(&self, x: f64, y: f64) -> Option<[f32; 3]> {
+        sample_rgb8(self, x, y)
+    }
+}
+
+impl Pass for Rgb16Image {
+    #[inline]
+    fn sample(&self, x: f64, y: f64) -> Option<[f32; 3]> {
+        sample_rgb16(self, x, y)
+    }
+}
 
 /// Width in source pixels over which a pass fades in from its border. Ramping
 /// over a wide band is what hides a residual step at the join.
@@ -117,10 +139,16 @@ fn feather_weight(x: f64, y: f64, width: f64, height: f64, feather: f64) -> f32 
     (weight as f32).max(f32::MIN_POSITIVE)
 }
 
-/// Bilinear fetch of an RGB sample, as floats. Returns `None` outside the
-/// image, which is what excludes a pass from a canvas pixel it does not cover.
-fn sample_rgb8(img: &RgbImage, x: f64, y: f64) -> Option<[f32; 3]> {
-    let (w, h) = (img.width() as i64, img.height() as i64);
+/// The four corner offsets and fractional position of a bilinear fetch, or
+/// `None` outside the image.
+///
+/// Shared by both depths, and expressed as flat offsets into the raw buffer
+/// rather than as `get_pixel` calls: this runs once per pass per canvas pixel,
+/// and `get_pixel` would re-derive the same offset with a bounds check for
+/// every corner of every channel — twelve times over for one fetch.
+#[inline]
+fn bilinear_taps(width: u32, height: u32, x: f64, y: f64) -> Option<([usize; 4], f32, f32)> {
+    let (w, h) = (width as i64, height as i64);
     let (x0, y0) = (x.floor() as i64, y.floor() as i64);
     if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
         return None;
@@ -128,30 +156,36 @@ fn sample_rgb8(img: &RgbImage, x: f64, y: f64) -> Option<[f32; 3]> {
     let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
     let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
 
+    // Offsets are in channels, so a caller adds its channel index directly.
+    let stride = width as usize * 3;
+    let (x0, x1) = (x0 as usize * 3, x1 as usize * 3);
+    let (row0, row1) = (y0 as usize * stride, y1 as usize * stride);
+    Some(([row0 + x0, row0 + x1, row1 + x0, row1 + x1], fx, fy))
+}
+
+/// Bilinear fetch of an RGB sample, as floats. Returns `None` outside the
+/// image, which is what excludes a pass from a canvas pixel it does not cover.
+fn sample_rgb8(img: &RgbImage, x: f64, y: f64) -> Option<[f32; 3]> {
+    let ([tl, tr, bl, br], fx, fy) = bilinear_taps(img.width(), img.height(), x, y)?;
+    let data: &[u8] = img;
+
     let mut out = [0.0f32; 3];
     for (channel, slot) in out.iter_mut().enumerate() {
-        let p = |px: i64, py: i64| img.get_pixel(px as u32, py as u32).0[channel] as f32;
-        let top = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
-        let bottom = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
+        let top = data[tl + channel] as f32 * (1.0 - fx) + data[tr + channel] as f32 * fx;
+        let bottom = data[bl + channel] as f32 * (1.0 - fx) + data[br + channel] as f32 * fx;
         *slot = top * (1.0 - fy) + bottom * fy;
     }
     Some(out)
 }
 
 fn sample_rgb16(img: &Rgb16Image, x: f64, y: f64) -> Option<[f32; 3]> {
-    let (w, h) = (img.width() as i64, img.height() as i64);
-    let (x0, y0) = (x.floor() as i64, y.floor() as i64);
-    if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
-        return None;
-    }
-    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-    let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+    let ([tl, tr, bl, br], fx, fy) = bilinear_taps(img.width(), img.height(), x, y)?;
+    let data: &[u16] = img;
 
     let mut out = [0.0f32; 3];
     for (channel, slot) in out.iter_mut().enumerate() {
-        let p = |px: i64, py: i64| img.get_pixel(px as u32, py as u32).0[channel] as f32;
-        let top = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
-        let bottom = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
+        let top = data[tl + channel] as f32 * (1.0 - fx) + data[tr + channel] as f32 * fx;
+        let bottom = data[bl + channel] as f32 * (1.0 - fx) + data[br + channel] as f32 * fx;
         *slot = top * (1.0 - fy) + bottom * fy;
     }
     Some(out)
@@ -163,18 +197,57 @@ struct Placement {
     inverse: Similarity,
     width: f64,
     height: f64,
+    /// Axis-aligned bounds of this pass's footprint on the canvas, as
+    /// `(x0, y0, x1, y1)` inclusive. A rotated pass does not fill its own
+    /// bounding box, so this is a superset of where `covers` holds — which is
+    /// all it is used for: skipping canvas the pass cannot possibly reach.
+    bounds: (f64, f64, f64, f64),
 }
 
 fn placements(transforms: &[Similarity], sizes: &[(u32, u32)]) -> Vec<Placement> {
     transforms
         .iter()
         .zip(sizes)
-        .map(|(&transform, &(w, h))| Placement {
-            inverse: transform.inverse(),
-            width: w as f64,
-            height: h as f64,
+        .map(|(&transform, &(w, h))| {
+            // `covers` accepts source coordinates in [0, w-1] x [0, h-1], so
+            // those corners are the ones whose image bounds the footprint.
+            let (last_x, last_y) = (w as f64 - 1.0, h as f64 - 1.0);
+            let corners = [
+                transform.apply((0.0, 0.0)),
+                transform.apply((last_x, 0.0)),
+                transform.apply((last_x, last_y)),
+                transform.apply((0.0, last_y)),
+            ];
+            let bounds = corners.iter().fold(
+                (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+                |(x0, y0, x1, y1), &(x, y)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            );
+            Placement {
+                inverse: transform.inverse(),
+                width: w as f64,
+                height: h as f64,
+                bounds,
+            }
         })
         .collect()
+}
+
+/// Canvas rows and columns where two passes could both reach, as half-open
+/// ranges already clipped to the canvas. Empty when their footprints are
+/// disjoint.
+fn overlap_window(
+    a: &Placement,
+    b: &Placement,
+    width: usize,
+    height: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let x0 = a.bounds.0.max(b.bounds.0).floor().max(0.0) as usize;
+    let y0 = a.bounds.1.max(b.bounds.1).floor().max(0.0) as usize;
+    // `+ 1` for the half-open end, then clamp; `ceil` so a fractional edge is
+    // included rather than trimmed.
+    let x1 = (a.bounds.2.min(b.bounds.2).ceil().max(0.0) as usize + 1).min(width);
+    let y1 = (a.bounds.3.min(b.bounds.3).ceil().max(0.0) as usize + 1).min(height);
+    (x0..x1.max(x0), y0..y1.max(y0))
 }
 
 fn validate(
@@ -215,17 +288,48 @@ const MAX_MULTIBAND_PIXELS: u64 = 120_000_000;
 ///
 /// The masks sum to 1 at every covered pixel, which is what lets `blend_channel`
 /// skip per-level renormalization.
-fn selection_masks(
+/// One bit per canvas pixel, recording whether a given pass reaches it.
+///
+/// Deciding that costs an inverse transform and a bounds test, and later stages
+/// need the same answer for the same pixels. A bit each is 8 MB for a
+/// 60-megapixel canvas, against re-deriving it tens of millions of times.
+pub struct Coverage {
+    words: Vec<u64>,
+}
+
+impl Coverage {
+    fn new(pixels: usize) -> Self {
+        Self {
+            words: vec![0u64; pixels.div_ceil(64)],
+        }
+    }
+
+    #[inline]
+    fn set(&mut self, pixel: usize) {
+        self.words[pixel / 64] |= 1u64 << (pixel % 64);
+    }
+
+    #[inline]
+    pub fn get(&self, pixel: usize) -> bool {
+        self.words[pixel / 64] & (1u64 << (pixel % 64)) != 0
+    }
+}
+
+fn selection_masks<P: Pass>(
     places: &[Placement],
+    passes: &[P],
     canvas_width: u32,
     canvas_height: u32,
-    covered_by: &dyn Fn(usize, f64, f64) -> bool,
-) -> (Vec<Vec<f32>>, Vec<bool>, Vec<u16>) {
+) -> (Vec<Vec<f32>>, Vec<bool>, Vec<u16>, Vec<Coverage>) {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
     let mut masks: Vec<Vec<f32>> = places.iter().map(|_| vec![0.0f32; width * height]).collect();
     let mut coverage = vec![false; width * height];
     // 0 = uncovered, otherwise the owning pass index + 1.
     let mut ownership = vec![0u16; width * height];
+    let mut per_pass: Vec<Coverage> = places
+        .iter()
+        .map(|_| Coverage::new(width * height))
+        .collect();
 
     for y in 0..height {
         for x in 0..width {
@@ -233,7 +337,16 @@ fn selection_masks(
             let (mut best, mut best_weight) = (usize::MAX, 0.0f32);
             for (index, place) in places.iter().enumerate() {
                 let (sx, sy) = place.inverse.apply((x as f64, y as f64));
-                if !covered_by(index, sx, sy) {
+                // Recorded against `covers`, deliberately not against
+                // `covered_by`. The two disagree on the outermost half-pixel —
+                // a sampler still interpolates at `w - 0.5`, where `covers`
+                // has already stopped — and the consumers of this bitmap are
+                // the ones that ask `covers`. Both are derived from the same
+                // inverse transform, so keeping them apart is free.
+                if in_bounds(sx, sy, place) {
+                    per_pass[index].set(flat);
+                }
+                if passes[index].sample(sx, sy).is_none() {
                     continue;
                 }
                 let weight = selection_weight(sx, sy, place.width, place.height);
@@ -249,7 +362,7 @@ fn selection_masks(
             }
         }
     }
-    (masks, coverage, ownership)
+    (masks, coverage, ownership, per_pass)
 }
 
 /// Nodes the seam solve may use. Seam *placement* does not need full
@@ -259,10 +372,16 @@ fn selection_masks(
 /// more generous than that and still small.
 const SEAM_MAX_NODES: u64 = 600_000;
 
+/// Whether a source coordinate lies within a pass, given the pass it came from.
+#[inline]
+fn in_bounds(sx: f64, sy: f64, place: &Placement) -> bool {
+    sx >= 0.0 && sy >= 0.0 && sx <= place.width - 1.0 && sy <= place.height - 1.0
+}
+
 /// Whether a pass reaches a canvas point, without paying for a sample.
 fn covers(place: &Placement, x: f64, y: f64) -> bool {
     let (sx, sy) = place.inverse.apply((x, y));
-    sx >= 0.0 && sy >= 0.0 && sx <= place.width - 1.0 && sy <= place.height - 1.0
+    in_bounds(sx, sy, place)
 }
 
 /// Re-place the boundary between each overlapping pair of passes so it follows
@@ -272,10 +391,10 @@ fn covers(place: &Placement, x: f64, y: f64) -> bool {
 /// over the full-resolution ownership map. A pair that cannot produce a cut —
 /// no shared area, or nothing anchored to one side — is left as the geometry
 /// had it.
-fn refine_seams(
+fn refine_seams<P: Pass>(
     ownership: &mut [u16],
     places: &[Placement],
-    samplers: &[&dyn Fn(f64, f64) -> Option<[f32; 3]>],
+    passes: &[P],
     canvas_width: u32,
     canvas_height: u32,
 ) -> Option<usize> {
@@ -322,14 +441,10 @@ fn refine_seams(
                     shared += 1;
 
                     // Disagreement between the passes here: OpenCV's COST_COLOR.
-                    let sample_a = samplers[a](
-                        places[a].inverse.apply((x, y)).0,
-                        places[a].inverse.apply((x, y)).1,
-                    );
-                    let sample_b = samplers[b](
-                        places[b].inverse.apply((x, y)).0,
-                        places[b].inverse.apply((x, y)).1,
-                    );
+                    let (ax, ay) = places[a].inverse.apply((x, y));
+                    let (bx, by) = places[b].inverse.apply((x, y));
+                    let sample_a = passes[a].sample(ax, ay);
+                    let sample_b = passes[b].sample(bx, by);
                     if let (Some(sa), Some(sb)) = (sample_a, sample_b) {
                         cost[slot] = sa
                             .iter()
@@ -349,9 +464,15 @@ fn refine_seams(
 
             // Write the decision back at full resolution, touching only the
             // pixels these two were contesting.
-            for y in 0..height {
+            //
+            // Confined to where their footprints actually meet. A pixel outside
+            // that window cannot be covered by both, so the full-canvas scan
+            // this replaces spent most of its time proving the same negative
+            // over and over — twice per pixel, per pair.
+            let (xs, ys) = overlap_window(&places[a], &places[b], width, height);
+            for y in ys {
                 let gy = (y / stride).min(grid_h - 1);
-                for x in 0..width {
+                for x in xs.clone() {
                     let index = y * width + x;
                     let held = ownership[index];
                     if held != owner_a && held != owner_b {
@@ -389,7 +510,7 @@ fn refine_seams(
 /// kernel over a canvas of tens of megapixels.
 fn soften_masks(
     masks: &mut [Vec<f32>],
-    places: &[Placement],
+    per_pass: &[Coverage],
     canvas_width: u32,
     canvas_height: u32,
     stride: usize,
@@ -420,41 +541,46 @@ fn soften_masks(
 
     // Smoothing spreads a mask past its own pass, where the warp only has
     // clamped edge pixels to offer. Clip each mask back to its coverage, then
-    // restore the sum-to-one that `blend_channel` relies on.
-    for y in 0..height {
-        for x in 0..width {
-            let slot = y * width + x;
-            let mut total = 0.0f32;
-            for (index, place) in places.iter().enumerate() {
-                if !covers(place, x as f64, y as f64) {
-                    masks[index][slot] = 0.0;
-                } else {
-                    masks[index][slot] = masks[index][slot].max(0.0);
-                    total += masks[index][slot];
-                }
+    // restore the sum-to-one that the blender relies on.
+    //
+    // Coverage comes from the bitmap `selection_masks` already built. Asking
+    // `covers` again would repeat an inverse transform per pass per pixel, for
+    // an answer that has not changed.
+    for slot in 0..width * height {
+        let mut total = 0.0f32;
+        for (index, coverage) in per_pass.iter().enumerate() {
+            if !coverage.get(slot) {
+                masks[index][slot] = 0.0;
+            } else {
+                masks[index][slot] = masks[index][slot].max(0.0);
+                total += masks[index][slot];
             }
-            if total > 0.0 {
-                for mask in masks.iter_mut() {
-                    mask[slot] /= total;
-                }
+        }
+        if total > 0.0 {
+            for mask in masks.iter_mut() {
+                mask[slot] /= total;
             }
         }
     }
 }
 
-/// Warp one channel of one pass onto the canvas. Uncovered pixels are filled
-/// with the pass's nearest edge value rather than a constant, so the pyramid
-/// does not manufacture a huge false edge at the pass boundary and bleed it
-/// back into the seam.
-fn warp_channel(
+/// Warp one pass onto the canvas, all three channels at once. Uncovered pixels
+/// are filled with the pass's nearest edge value rather than a constant, so the
+/// pyramid does not manufacture a huge false edge at the pass boundary and
+/// bleed it back into the seam.
+///
+/// All three channels together, not one at a time, because the sampler computes
+/// every channel of a bilinear fetch whether or not the caller wants them.
+/// Warping channel by channel therefore did the inverse transform and the fetch
+/// three times over and discarded two thirds of each result.
+fn warp_pass<P: Pass>(
     place: &Placement,
     canvas_width: u32,
     canvas_height: u32,
-    channel: usize,
-    sample: &dyn Fn(f64, f64) -> Option<[f32; 3]>,
-) -> Vec<f32> {
+    pass: &P,
+) -> [Vec<f32>; 3] {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
-    let mut plane = vec![0.0f32; width * height];
+    let mut planes: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0f32; width * height]);
     for y in 0..height {
         for x in 0..width {
             let (sx, sy) = place.inverse.apply((x as f64, y as f64));
@@ -462,39 +588,39 @@ fn warp_channel(
                 sx.clamp(0.0, place.width - 1.0),
                 sy.clamp(0.0, place.height - 1.0),
             );
-            if let Some(values) = sample(clamped.0, clamped.1) {
-                plane[y * width + x] = values[channel];
+            if let Some(values) = pass.sample(clamped.0, clamped.1) {
+                let slot = y * width + x;
+                planes[0][slot] = values[0];
+                planes[1][slot] = values[1];
+                planes[2][slot] = values[2];
             }
         }
     }
-    plane
+    planes
 }
 
 /// Shared compositing core. Returns the blended canvas as three f32 planes plus
 /// coverage, leaving quantization to the caller.
-fn composite_planes(
+fn composite_planes<P: Pass>(
     places: &[Placement],
+    passes: &[P],
     canvas_width: u32,
     canvas_height: u32,
     feather: f64,
-    samplers: &[&dyn Fn(f64, f64) -> Option<[f32; 3]>],
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
 ) -> (Vec<Vec<f32>>, Vec<bool>, usize, Vec<u16>) {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
 
-    let covered_by = |index: usize, sx: f64, sy: f64| samplers[index](sx, sy).is_some();
-    let (mut masks, coverage, mut ownership) =
-        selection_masks(places, canvas_width, canvas_height, &covered_by);
+    let (mut masks, coverage, mut ownership, per_pass) = super::timed(timings, "select", || {
+        selection_masks(places, passes, canvas_width, canvas_height)
+    });
 
     // Geometry only decides where the boundary *starts*; the min cut moves it
     // onto pixels where the passes agree, which is what makes the regions
     // follow content instead of the layout.
-    let seam_stride = refine_seams(
-        &mut ownership,
-        places,
-        samplers,
-        canvas_width,
-        canvas_height,
-    );
+    let seam_stride = super::timed(timings, "seam", || {
+        refine_seams(&mut ownership, places, passes, canvas_width, canvas_height)
+    });
     for (index, mask) in masks.iter_mut().enumerate() {
         let owner = index as u16 + 1;
         for (slot, value) in mask.iter_mut().enumerate() {
@@ -502,7 +628,9 @@ fn composite_planes(
         }
     }
     if let Some(stride) = seam_stride {
-        soften_masks(&mut masks, places, canvas_width, canvas_height, stride);
+        super::timed(timings, "soften", || {
+            soften_masks(&mut masks, &per_pass, canvas_width, canvas_height, stride)
+        });
     }
 
     let pixels = width as u64 * height as u64;
@@ -520,34 +648,33 @@ fn composite_planes(
     // A single band is a plain masked composite, so soften the hard selection
     // edge with the feather weights instead of leaving a visible cut.
     let masks = if levels == 1 {
-        feathered_masks(places, canvas_width, canvas_height, feather, &covered_by)
+        feathered_masks(places, passes, canvas_width, canvas_height, feather)
     } else {
         masks
     };
 
-    let mut planes = Vec::with_capacity(3);
-    for channel in 0..3 {
-        let warped: Vec<Vec<f32>> = places
-            .iter()
-            .zip(samplers)
-            .map(|(place, sample)| {
-                warp_channel(place, canvas_width, canvas_height, channel, *sample)
-            })
-            .collect();
-        planes.push(blend::blend_channel(&warped, &masks, width, height, levels));
+    // Stream pass by pass: warp one, fold it into the bands, drop it. Only one
+    // pass's planes and pyramids are live at a time.
+    let mut blender = blend::Blender::<3>::new(width, height, levels);
+    for ((place, pass), mask) in places.iter().zip(passes).zip(&masks) {
+        let warped = super::timed(timings, "warp", || {
+            warp_pass(place, canvas_width, canvas_height, pass)
+        });
+        super::timed(timings, "blend", || blender.add_pass(warped, mask));
     }
+    let planes = super::timed(timings, "collapse", || blender.finish()).to_vec();
 
     (planes, coverage, levels, ownership)
 }
 
 /// Proportional feather weights, normalized to sum to 1 per pixel. Only used
 /// for the single-band fallback.
-fn feathered_masks(
+fn feathered_masks<P: Pass>(
     places: &[Placement],
+    passes: &[P],
     canvas_width: u32,
     canvas_height: u32,
     feather: f64,
-    covered_by: &dyn Fn(usize, f64, f64) -> bool,
 ) -> Vec<Vec<f32>> {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
     let mut masks: Vec<Vec<f32>> = places.iter().map(|_| vec![0.0f32; width * height]).collect();
@@ -558,7 +685,7 @@ fn feathered_masks(
             let mut total = 0.0f32;
             for (index, place) in places.iter().enumerate() {
                 let (sx, sy) = place.inverse.apply((x as f64, y as f64));
-                if !covered_by(index, sx, sy) {
+                if passes[index].sample(sx, sy).is_none() {
                     continue;
                 }
                 let weight = feather_weight(sx, sy, place.width, place.height, feather);
@@ -582,45 +709,23 @@ pub fn composite_rgb8(
     canvas_width: u32,
     canvas_height: u32,
     feather: f64,
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
 ) -> Result<(RgbImage, Vec<bool>, usize, Vec<u16>)> {
     validate(passes.len(), transforms, canvas_width, canvas_height)?;
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
     let places = placements(transforms, &sizes);
 
-    let samplers: Vec<Sampler<'_>> = passes
-        .iter()
-        .map(|pass| {
-            Box::new(move |x: f64, y: f64| sample_rgb8(pass, x, y)) as Sampler<'_>
-        })
-        .collect();
-    let sampler_refs: Vec<&dyn Fn(f64, f64) -> Option<[f32; 3]>> =
-        samplers.iter().map(|s| s.as_ref()).collect();
+    let (planes, coverage, levels, ownership) =
+        composite_planes(&places, passes, canvas_width, canvas_height, feather, timings);
 
-    let (planes, coverage, levels, ownership) = composite_planes(
-        &places,
-        canvas_width,
-        canvas_height,
-        feather,
-        &sampler_refs,
-    );
-
-    let width = canvas_width as usize;
     let mut out = RgbImage::from_pixel(canvas_width, canvas_height, Rgb([UNCOVERED_8; 3]));
-    for y in 0..canvas_height {
-        for x in 0..canvas_width {
-            let flat = y as usize * width + x as usize;
-            if !coverage[flat] {
-                continue;
-            }
-            out.put_pixel(
-                x,
-                y,
-                Rgb([
-                    planes[0][flat].round().clamp(0.0, 255.0) as u8,
-                    planes[1][flat].round().clamp(0.0, 255.0) as u8,
-                    planes[2][flat].round().clamp(0.0, 255.0) as u8,
-                ]),
-            );
+    let data: &mut [u8] = &mut out;
+    for (flat, pixel) in data.chunks_exact_mut(3).enumerate() {
+        if !coverage[flat] {
+            continue;
+        }
+        for (channel, slot) in pixel.iter_mut().enumerate() {
+            *slot = planes[channel][flat].round().clamp(0.0, 255.0) as u8;
         }
     }
 
@@ -634,45 +739,23 @@ pub fn composite_rgb16(
     canvas_width: u32,
     canvas_height: u32,
     feather: f64,
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
 ) -> Result<(Rgb16Image, Vec<bool>, usize, Vec<u16>)> {
     validate(passes.len(), transforms, canvas_width, canvas_height)?;
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
     let places = placements(transforms, &sizes);
 
-    let samplers: Vec<Sampler<'_>> = passes
-        .iter()
-        .map(|pass| {
-            Box::new(move |x: f64, y: f64| sample_rgb16(pass, x, y)) as Sampler<'_>
-        })
-        .collect();
-    let sampler_refs: Vec<&dyn Fn(f64, f64) -> Option<[f32; 3]>> =
-        samplers.iter().map(|s| s.as_ref()).collect();
+    let (planes, coverage, levels, ownership) =
+        composite_planes(&places, passes, canvas_width, canvas_height, feather, timings);
 
-    let (planes, coverage, levels, ownership) = composite_planes(
-        &places,
-        canvas_width,
-        canvas_height,
-        feather,
-        &sampler_refs,
-    );
-
-    let width = canvas_width as usize;
     let mut out = Rgb16Image::from_pixel(canvas_width, canvas_height, Rgb([UNCOVERED_16; 3]));
-    for y in 0..canvas_height {
-        for x in 0..canvas_width {
-            let flat = y as usize * width + x as usize;
-            if !coverage[flat] {
-                continue;
-            }
-            out.put_pixel(
-                x,
-                y,
-                Rgb([
-                    planes[0][flat].round().clamp(0.0, 65535.0) as u16,
-                    planes[1][flat].round().clamp(0.0, 65535.0) as u16,
-                    planes[2][flat].round().clamp(0.0, 65535.0) as u16,
-                ]),
-            );
+    let data: &mut [u16] = &mut out;
+    for (flat, pixel) in data.chunks_exact_mut(3).enumerate() {
+        if !coverage[flat] {
+            continue;
+        }
+        for (channel, slot) in pixel.iter_mut().enumerate() {
+            *slot = planes[channel][flat].round().clamp(0.0, 65535.0) as u16;
         }
     }
 
@@ -687,6 +770,7 @@ pub fn composite(
     canvas_width: u32,
     canvas_height: u32,
     feather: f64,
+    timings: &mut Vec<(&'static str, std::time::Duration)>,
 ) -> Result<Composite> {
     validate(passes.len(), transforms, canvas_width, canvas_height)?;
 
@@ -710,6 +794,7 @@ pub fn composite(
             canvas_width,
             canvas_height,
             feather,
+            timings,
         )?;
         Ok(Composite {
             image: DynamicImage::ImageRgb16(image),
@@ -720,7 +805,7 @@ pub fn composite(
     } else {
         let converted: Vec<RgbImage> = passes.iter().map(|p| p.to_rgb8()).collect();
         let (image, coverage, levels, ownership) =
-            composite_rgb8(&converted, transforms, canvas_width, canvas_height, feather)?;
+            composite_rgb8(&converted, transforms, canvas_width, canvas_height, feather, timings)?;
         Ok(Composite {
             image: DynamicImage::ImageRgb8(image),
             levels,
@@ -754,25 +839,22 @@ pub fn ownership_overlay(merged: &DynamicImage, ownership: &[u16]) -> Result<Rgb
         bail!("ownership map does not match the merged image");
     }
     let grey = merged.to_luma8();
+    let luma: &[u8] = &grey;
     let mut out = RgbImage::new(width, height);
+    let data: &mut [u8] = &mut out;
 
-    for y in 0..height {
-        for x in 0..width {
-            let owner = ownership[y as usize * width as usize + x as usize];
-            let pixel = if owner == 0 {
-                Rgb([255, 0, 255])
-            } else {
-                let tint = OWNER_COLOURS[(owner as usize - 1) % OWNER_COLOURS.len()];
-                let luma = grey.get_pixel(x, y).0[0] as u16;
-                // Half tint, half content: enough colour to read the region,
-                // enough detail to judge whether the seam sits well.
-                Rgb([
-                    ((luma + tint[0] as u16) / 2) as u8,
-                    ((luma + tint[1] as u16) / 2) as u8,
-                    ((luma + tint[2] as u16) / 2) as u8,
-                ])
-            };
-            out.put_pixel(x, y, pixel);
+    for (flat, pixel) in data.chunks_exact_mut(3).enumerate() {
+        let owner = ownership[flat];
+        if owner == 0 {
+            pixel.copy_from_slice(&[255, 0, 255]);
+            continue;
+        }
+        let tint = OWNER_COLOURS[(owner as usize - 1) % OWNER_COLOURS.len()];
+        let value = luma[flat] as u16;
+        // Half tint, half content: enough colour to read the region, enough
+        // detail to judge whether the seam sits well.
+        for (channel, slot) in pixel.iter_mut().enumerate() {
+            *slot = ((value + tint[channel] as u16) / 2) as u8;
         }
     }
     Ok(out)
@@ -785,6 +867,38 @@ mod tests {
 
     fn solid8(w: u32, h: u32, colour: [u8; 3]) -> RgbImage {
         RgbImage::from_pixel(w, h, Rgb(colour))
+    }
+
+    // The stage timings are a `--debug` diagnostic, not something any test
+    // asserts on, so these shadow the real entry points with the sink supplied.
+    fn composite_rgb8(
+        passes: &[RgbImage],
+        transforms: &[Similarity],
+        w: u32,
+        h: u32,
+        feather: f64,
+    ) -> Result<(RgbImage, Vec<bool>, usize, Vec<u16>)> {
+        super::composite_rgb8(passes, transforms, w, h, feather, &mut Vec::new())
+    }
+
+    fn composite_rgb16(
+        passes: &[Rgb16Image],
+        transforms: &[Similarity],
+        w: u32,
+        h: u32,
+        feather: f64,
+    ) -> Result<(Rgb16Image, Vec<bool>, usize, Vec<u16>)> {
+        super::composite_rgb16(passes, transforms, w, h, feather, &mut Vec::new())
+    }
+
+    fn composite(
+        passes: &[&DynamicImage],
+        transforms: &[Similarity],
+        w: u32,
+        h: u32,
+        feather: f64,
+    ) -> Result<Composite> {
+        super::composite(passes, transforms, w, h, feather, &mut Vec::new())
     }
 
     #[test]
@@ -849,7 +963,20 @@ mod tests {
             }
         }
 
-        soften_masks(&mut masks, &places, w as u32, h as u32, 8);
+        // Both passes are identity-placed over the whole canvas, so both cover
+        // every pixel.
+        let per_pass: Vec<Coverage> = places
+            .iter()
+            .map(|_| {
+                let mut coverage = Coverage::new(w * h);
+                for slot in 0..w * h {
+                    coverage.set(slot);
+                }
+                coverage
+            })
+            .collect();
+
+        soften_masks(&mut masks, &per_pass, w as u32, h as u32, 8);
 
         // Sum-to-one holds everywhere both passes cover.
         for (slot, (first, second)) in masks[0].iter().zip(&masks[1]).enumerate() {

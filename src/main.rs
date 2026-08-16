@@ -341,6 +341,36 @@ fn log_merge_report(passes: &[PathBuf], merged: &merge::Merged) {
     } else {
         elog!("  blending: multi-band, {} bands", report.levels);
     }
+
+    // Stage costs are wildly uneven and rarely where you would guess, so the
+    // only way to tell why a merge was slow is to see them side by side. Stages
+    // that run once per channel are summed rather than listed three times.
+    if !report.timings.is_empty() {
+        let mut totals: Vec<(&str, std::time::Duration, usize)> = Vec::new();
+        for &(label, elapsed) in &report.timings {
+            match totals.iter_mut().find(|(name, _, _)| *name == label) {
+                Some(entry) => {
+                    entry.1 += elapsed;
+                    entry.2 += 1;
+                }
+                None => totals.push((label, elapsed, 1)),
+            }
+        }
+        let whole: f64 = totals.iter().map(|(_, d, _)| d.as_secs_f64()).sum();
+        elog!("  timings: {whole:.1}s total");
+        for (label, elapsed, count) in totals {
+            let runs = if count > 1 {
+                format!(" ({count} runs)")
+            } else {
+                String::new()
+            };
+            elog!(
+                "    {label:<10} {:>7.2}s  {:>4.0}%{runs}",
+                elapsed.as_secs_f64(),
+                elapsed.as_secs_f64() / whole * 100.0
+            );
+        }
+    }
 }
 
 /// Where the merged image lands: next to the first pass (or under
