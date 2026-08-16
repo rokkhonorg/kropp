@@ -23,6 +23,7 @@ use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
 
 use super::blend;
 use super::geometry::Similarity;
+use super::seam;
 
 /// Fetches an RGB sample from one pass at a source coordinate, or `None`
 /// outside it. Boxed so both depths share the compositing core.
@@ -251,6 +252,196 @@ fn selection_masks(
     (masks, coverage, ownership)
 }
 
+/// Nodes the seam solve may use. Seam *placement* does not need full
+/// resolution — only the blend does — and BK holds roughly 40 bytes per node
+/// plus its arcs, so a full-resolution overlap would run to gigabytes across
+/// several pairs. OpenCV finds seams at 0.1 MP for the same reason; this is
+/// more generous than that and still small.
+const SEAM_MAX_NODES: u64 = 600_000;
+
+/// Whether a pass reaches a canvas point, without paying for a sample.
+fn covers(place: &Placement, x: f64, y: f64) -> bool {
+    let (sx, sy) = place.inverse.apply((x, y));
+    sx >= 0.0 && sy >= 0.0 && sx <= place.width - 1.0 && sy <= place.height - 1.0
+}
+
+/// Re-place the boundary between each overlapping pair of passes so it follows
+/// pixels where they agree, instead of the geometric locus.
+///
+/// Each pair is solved independently at reduced resolution and written back
+/// over the full-resolution ownership map. A pair that cannot produce a cut —
+/// no shared area, or nothing anchored to one side — is left as the geometry
+/// had it.
+fn refine_seams(
+    ownership: &mut [u16],
+    places: &[Placement],
+    samplers: &[&dyn Fn(f64, f64) -> Option<[f32; 3]>],
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Option<usize> {
+    let (width, height) = (canvas_width as usize, canvas_height as usize);
+    let area = width as u64 * height as u64;
+    // One stride for every pair, so the solves stay comparable.
+    let stride = ((area as f64 / SEAM_MAX_NODES as f64).sqrt().ceil() as usize).max(1);
+    let (grid_w, grid_h) = (width.div_ceil(stride), height.div_ceil(stride));
+    if grid_w < 3 || grid_h < 3 {
+        return None;
+    }
+
+    for a in 0..places.len() {
+        for b in (a + 1)..places.len() {
+            let (owner_a, owner_b) = (a as u16 + 1, b as u16 + 1);
+            let mut state = vec![seam::Cell::Absent; grid_w * grid_h];
+            let mut cost = vec![0.0f32; grid_w * grid_h];
+            let mut shared = 0usize;
+
+            for gy in 0..grid_h {
+                for gx in 0..grid_w {
+                    let (x, y) = ((gx * stride) as f64, (gy * stride) as f64);
+                    let (in_a, in_b) = (covers(&places[a], x, y), covers(&places[b], x, y));
+                    let slot = gy * grid_w + gx;
+                    if !in_a && !in_b {
+                        continue;
+                    }
+                    if in_a && !in_b {
+                        state[slot] = seam::Cell::OnlyA;
+                        continue;
+                    }
+                    if in_b && !in_a {
+                        state[slot] = seam::Cell::OnlyB;
+                        continue;
+                    }
+                    // Shared: only contest it if one of the two currently holds
+                    // it, so a third pass's territory is left alone.
+                    let held = ownership[(gy * stride).min(height - 1) * width
+                        + (gx * stride).min(width - 1)];
+                    if held != owner_a && held != owner_b {
+                        continue;
+                    }
+                    state[slot] = seam::Cell::Both;
+                    shared += 1;
+
+                    // Disagreement between the passes here: OpenCV's COST_COLOR.
+                    let sample_a = samplers[a](
+                        places[a].inverse.apply((x, y)).0,
+                        places[a].inverse.apply((x, y)).1,
+                    );
+                    let sample_b = samplers[b](
+                        places[b].inverse.apply((x, y)).0,
+                        places[b].inverse.apply((x, y)).1,
+                    );
+                    if let (Some(sa), Some(sb)) = (sample_a, sample_b) {
+                        cost[slot] = sa
+                            .iter()
+                            .zip(&sb)
+                            .map(|(p, q)| (p - q).abs())
+                            .sum::<f32>();
+                    }
+                }
+            }
+            if shared == 0 {
+                continue;
+            }
+
+            let Some(owned_by_a) = seam::cut_ownership(&state, &cost, grid_w, grid_h) else {
+                continue;
+            };
+
+            // Write the decision back at full resolution, touching only the
+            // pixels these two were contesting.
+            for y in 0..height {
+                let gy = (y / stride).min(grid_h - 1);
+                for x in 0..width {
+                    let index = y * width + x;
+                    let held = ownership[index];
+                    if held != owner_a && held != owner_b {
+                        continue;
+                    }
+                    let (fx, fy) = (x as f64, y as f64);
+                    if !covers(&places[a], fx, fy) || !covers(&places[b], fx, fy) {
+                        continue;
+                    }
+                    let gx = (x / stride).min(grid_w - 1);
+                    ownership[index] = if owned_by_a[gy * grid_w + gx] {
+                        owner_a
+                    } else {
+                        owner_b
+                    };
+                }
+            }
+        }
+    }
+    Some(stride)
+}
+
+/// Soften the ownership boundary, so the seam hands over gradually instead of
+/// as a hard step.
+///
+/// Two reasons it needs this. The cut is solved on a coarse grid and upscaled,
+/// so its boundary arrives carrying that grid's staircase; and even a perfect
+/// boundary is a one-pixel switch, which the finest pyramid band reproduces
+/// faithfully as an edge. Smoothing over roughly one coarse cell removes the
+/// staircase and gives the blend a gentle handover, at a cost of only the
+/// sharpness within that narrow band.
+///
+/// The smoothing runs down and back up an image pyramid rather than as a wide
+/// convolution: reaching a ten-pixel radius directly would need a very large
+/// kernel over a canvas of tens of megapixels.
+fn soften_masks(
+    masks: &mut [Vec<f32>],
+    places: &[Placement],
+    canvas_width: u32,
+    canvas_height: u32,
+    stride: usize,
+) {
+    let (width, height) = (canvas_width as usize, canvas_height as usize);
+    // Each level halves, so this reaches about one coarse cell.
+    let levels = (stride as f64).log2().ceil().max(1.0) as usize;
+    let levels = levels.clamp(1, 5);
+
+    for mask in masks.iter_mut() {
+        let mut sizes = vec![(width, height)];
+        let mut current = mask.clone();
+        let (mut w, mut h) = (width, height);
+        for _ in 0..levels {
+            let (next, nw, nh) = blend::pyr_down(&current, w, h);
+            current = next;
+            w = nw;
+            h = nh;
+            sizes.push((w, h));
+        }
+        for level in (0..levels).rev() {
+            let (tw, th) = sizes[level];
+            let (sw, sh) = sizes[level + 1];
+            current = blend::pyr_up(&current, sw, sh, tw, th);
+        }
+        *mask = current;
+    }
+
+    // Smoothing spreads a mask past its own pass, where the warp only has
+    // clamped edge pixels to offer. Clip each mask back to its coverage, then
+    // restore the sum-to-one that `blend_channel` relies on.
+    for y in 0..height {
+        for x in 0..width {
+            let slot = y * width + x;
+            let mut total = 0.0f32;
+            for (index, place) in places.iter().enumerate() {
+                if !covers(place, x as f64, y as f64) {
+                    masks[index][slot] = 0.0;
+                } else {
+                    masks[index][slot] = masks[index][slot].max(0.0);
+                    total += masks[index][slot];
+                }
+            }
+            if total > 0.0 {
+                for mask in masks.iter_mut() {
+                    mask[slot] /= total;
+                }
+            }
+        }
+    }
+}
+
 /// Warp one channel of one pass onto the canvas. Uncovered pixels are filled
 /// with the pass's nearest edge value rather than a constant, so the pyramid
 /// does not manufacture a huge false edge at the pass boundary and bleed it
@@ -291,8 +482,28 @@ fn composite_planes(
     let (width, height) = (canvas_width as usize, canvas_height as usize);
 
     let covered_by = |index: usize, sx: f64, sy: f64| samplers[index](sx, sy).is_some();
-    let (masks, coverage, ownership) =
+    let (mut masks, coverage, mut ownership) =
         selection_masks(places, canvas_width, canvas_height, &covered_by);
+
+    // Geometry only decides where the boundary *starts*; the min cut moves it
+    // onto pixels where the passes agree, which is what makes the regions
+    // follow content instead of the layout.
+    let seam_stride = refine_seams(
+        &mut ownership,
+        places,
+        samplers,
+        canvas_width,
+        canvas_height,
+    );
+    for (index, mask) in masks.iter_mut().enumerate() {
+        let owner = index as u16 + 1;
+        for (slot, value) in mask.iter_mut().enumerate() {
+            *value = if ownership[slot] == owner { 1.0 } else { 0.0 };
+        }
+    }
+    if let Some(stride) = seam_stride {
+        soften_masks(&mut masks, places, canvas_width, canvas_height, stride);
+    }
 
     let pixels = width as u64 * height as u64;
     let levels = if pixels > MAX_MULTIBAND_PIXELS {
@@ -617,67 +828,90 @@ mod tests {
         assert_eq!(selection_weight(-1.0, 10.0, w, h), 0.0, "outside must score 0");
     }
 
-    /// With overlaps far wider than the feather span — as on real passes — the
-    /// seam must still land mid-overlap rather than collapsing onto a border.
+    /// Softening must produce a gradual handover, not leave a one-pixel step,
+    /// and must still leave the masks summing to one so the blend stays
+    /// energy-preserving.
     #[test]
-    fn seam_stays_mid_overlap_on_large_passes() {
-        // 1200-wide passes overlapping by 900px: nearly 20x the feather span.
-        let left = solid8(1200, 400, [0, 0, 0]);
-        let right = solid8(1200, 400, [255, 255, 255]);
+    fn softening_spreads_the_boundary_and_preserves_the_sum() {
+        let (w, h) = (64usize, 32usize);
+        let places = placements(
+            &[Similarity::IDENTITY, Similarity::IDENTITY],
+            &[(w as u32, h as u32), (w as u32, h as u32)],
+        );
+
+        // A hard split down the middle, as the cut hands over.
+        let mut masks = vec![vec![0.0f32; w * h], vec![0.0f32; w * h]];
+        for y in 0..h {
+            for x in 0..w {
+                let left = x < w / 2;
+                masks[0][y * w + x] = if left { 1.0 } else { 0.0 };
+                masks[1][y * w + x] = if left { 0.0 } else { 1.0 };
+            }
+        }
+
+        soften_masks(&mut masks, &places, w as u32, h as u32, 8);
+
+        // Sum-to-one holds everywhere both passes cover.
+        for (slot, (first, second)) in masks[0].iter().zip(&masks[1]).enumerate() {
+            let total = first + second;
+            assert!(
+                (total - 1.0).abs() < 1e-3,
+                "masks sum to {total} at {slot}, not 1"
+            );
+        }
+
+        // The handover is now gradual rather than a single-pixel step.
+        let row = h / 2;
+        let mid = w / 2;
+        let intermediate = (mid - 6..mid + 6)
+            .filter(|&x| {
+                let v = masks[0][row * w + x];
+                v > 0.05 && v < 0.95
+            })
+            .count();
+        assert!(
+            intermediate >= 4,
+            "only {intermediate} pixels are partially blended; the seam is              still effectively a hard step"
+        );
+
+        // And it stays a handover: monotonically decreasing left to right.
+        let mut previous = f32::INFINITY;
+        for x in mid - 6..mid + 6 {
+            let value = masks[0][row * w + x];
+            assert!(value <= previous + 1e-4, "handover reversed at x={x}");
+            previous = value;
+        }
+    }
+
+    /// Integration guard for the saturation bug, at the level it actually
+    /// broke: one pass swallowing the entire overlap.
+    ///
+    /// This deliberately does *not* assert where the seam lands. Ownership is
+    /// decided by minimum cut now, so on featureless input every boundary
+    /// position costs the same and any of them is a correct answer. What must
+    /// stay true is that both passes end up with a real share — the saturation
+    /// bug gave one pass everything it covered.
+    #[test]
+    fn neither_pass_swallows_a_large_overlap() {
+        // 1200-wide passes overlapping by 900px, far beyond the feather span
+        // that used to saturate.
+        let left = solid8(1200, 400, [40, 40, 40]);
+        let right = solid8(1200, 400, [210, 210, 210]);
         let transforms = [Similarity::IDENTITY, Similarity::translation(300.0, 0.0)];
 
         let (_, _, _, ownership) =
             composite_rgb8(&[left, right], &transforms, 1500, 400, DEFAULT_FEATHER).unwrap();
 
-        let width = 1500usize;
-        let boundary = (0..width)
-            .find(|&x| ownership[200 * width + x] == 2)
-            .unwrap_or(width);
+        let first = ownership.iter().filter(|&&o| o == 1).count();
+        let second = ownership.iter().filter(|&&o| o == 2).count();
+        let total = (first + second) as f64;
+        assert!(total > 0.0, "nothing was assigned");
 
-        // Overlap spans x 300..1200, so the seam belongs near x = 750.
+        let smaller = first.min(second) as f64 / total;
         assert!(
-            (700..800).contains(&boundary),
-            "seam at x={boundary} is not mid-overlap (300..1200); it has              collapsed onto a pass border"
-        );
-    }
-
-    /// The seam between two horizontally offset passes must be a straight
-    /// vertical line at every row.
-    ///
-    /// The earlier `min`-of-distances weighting tied exactly near the top and
-    /// bottom of the overlap, where both passes shared the same vertical
-    /// distance, and handed whole bands to one pass. Sampling only the middle
-    /// row — as the crossover test does — never saw it.
-    #[test]
-    fn seam_between_offset_passes_is_vertical_at_every_row() {
-        let left = solid8(100, 60, [0, 0, 0]);
-        let right = solid8(100, 60, [255, 255, 255]);
-        let transforms = [Similarity::IDENTITY, Similarity::translation(60.0, 0.0)];
-
-        let (_, _, _, ownership) =
-            composite_rgb8(&[left, right], &transforms, 160, 60, 30.0).unwrap();
-
-        // For each row, the first column owned by the second pass.
-        let width = 160usize;
-        let boundaries: Vec<usize> = (0..60)
-            .map(|y| {
-                (0..width)
-                    .find(|&x| ownership[y * width + x] == 2)
-                    .unwrap_or(width)
-            })
-            .collect();
-
-        let first = boundaries[2];
-        for (y, &boundary) in boundaries.iter().enumerate() {
-            assert!(
-                boundary.abs_diff(first) <= 1,
-                "seam jumps to x={boundary} at row {y} (expected ~{first});                  the selection is banding instead of cutting straight"
-            );
-        }
-        // And it should sit inside the overlap, not hard against an edge.
-        assert!(
-            (65..95).contains(&first),
-            "seam at x={first} is not near the middle of the 60..100 overlap"
+            smaller > 0.15,
+            "one pass took {:.0}% of the assigned canvas; the selection has              collapsed onto a pass border",
+            (1.0 - smaller) * 100.0
         );
     }
 

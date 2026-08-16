@@ -1,256 +1,325 @@
-//! Minimum-cost seam finding.
+//! Content-aware seam placement by minimum cut.
 //!
-//! A geometric boundary — the locus where two passes are equally far from their
-//! own borders — is always a straight line for axis-aligned passes. That puts
-//! the seam wherever the geometry happens to fall, including straight through
-//! high-contrast detail, where any residual misalignment shows as a broken
-//! edge that no amount of blending hides.
+//! A geometric boundary — the locus where two passes are equally deep inside
+//! their own borders — is a smooth curve fixed by the layout alone. It lands
+//! wherever the geometry happens to put it, including straight through
+//! high-contrast detail, where any residual misalignment shows as a broken edge
+//! that blending cannot hide.
 //!
-//! A content-aware seam instead threads through pixels where the two passes
-//! already agree, dodging around detail. That is what makes the regions in
-//! Photoshop's Photomerge — and in the previous implementation's `gc_color`
-//! finder — irregular rather than rectangular.
+//! A minimum cut instead threads the boundary through pixels where the two
+//! passes already *agree*, so it dodges around detail and follows whatever
+//! path is cheapest. That is what makes the regions in Photoshop's Photomerge —
+//! and in the previous implementation's `gc_color` finder — irregular rather
+//! than geometric.
 //!
-//! This uses dynamic programming rather than graph cut. For the strip-shaped
-//! overlaps a flatbed produces, a single monotone path across the strip is the
-//! right model, and DP finds the global optimum for it in one pass without
-//! needing a max-flow solver. (OpenCV offers the same choice as
-//! `DpSeamFinder`.) The tradeoff is that the path must advance one row or
-//! column at a time, so it cannot double back — fine for a strip, wrong for
-//! seams that must wrap around an obstacle.
+//! The construction is Kwatra et al.'s, and matches OpenCV's
+//! `GraphCutSeamFinder` with `COST_COLOR`: one node per candidate pixel, an
+//! edge between neighbours whose capacity is how much the passes disagree
+//! there, and the regions only one pass covers wired to the terminals so the
+//! cut has something to separate. Cutting is then cheap exactly where the two
+//! passes look the same.
 
-/// Which way the seam runs across the overlap.
+use super::maxflow::Graph;
+
+/// What a pixel in the region under consideration is available for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Orientation {
-    /// One x per row, advancing down. For a tall overlap between passes offset
-    /// horizontally.
-    Vertical,
-    /// One y per column, advancing right. For a wide overlap between passes
-    /// offset vertically.
-    Horizontal,
+pub enum Cell {
+    /// Only the first pass reaches here, so it must stay with that pass. These
+    /// anchor the cut — without them there is nothing to separate and the
+    /// minimum cut is trivially empty.
+    OnlyA,
+    /// Likewise for the second pass.
+    OnlyB,
+    /// Both passes reach here; the cut decides.
+    Both,
+    /// Outside both passes, or already owned by a third. Gets no node.
+    Absent,
 }
 
-/// How far the seam may step sideways between adjacent rows. Allowing more than
-/// one keeps the path from being forced through expensive pixels just because
-/// it could not reach around them.
-const MAX_STEP: isize = 2;
-
-/// Cost of stepping sideways, in units of pixel cost. Small, so the seam
-/// prefers agreement but does not wander pointlessly.
-const STEP_PENALTY: f32 = 0.05;
-
-/// Find the cheapest monotone path across a `width` x `height` cost field.
+/// Decide ownership between two passes over a region, by minimum cut.
 ///
-/// `cost` is row-major disagreement between the two passes; `valid` marks the
-/// pixels the seam may pass through (the overlap). Returns one coordinate per
-/// row (`Vertical`) or per column (`Horizontal`), or `None` when some line has
-/// no valid pixel at all and no path can cross.
-pub fn min_cost_path(
+/// `cost` holds each pixel's disagreement between the passes, in any consistent
+/// unit — it is normalized internally. `true` in the result means the first
+/// pass owns that pixel.
+///
+/// Returns `None` when the region cannot produce a meaningful cut: no pixels,
+/// mismatched inputs, or nothing anchored to one of the two terminals.
+pub fn cut_ownership(
+    state: &[Cell],
     cost: &[f32],
-    valid: &[bool],
     width: usize,
     height: usize,
-    orientation: Orientation,
-) -> Option<Vec<usize>> {
-    if width == 0 || height == 0 || cost.len() != width * height || valid.len() != cost.len() {
+) -> Option<Vec<bool>> {
+    if width == 0 || height == 0 || state.len() != width * height || cost.len() != state.len() {
         return None;
     }
 
-    // Work in "line" x "position" terms so one implementation covers both
-    // orientations: a vertical seam has one position per row, a horizontal one
-    // has one position per column.
-    let (lines, positions) = match orientation {
-        Orientation::Vertical => (height, width),
-        Orientation::Horizontal => (width, height),
-    };
-    let at = |line: usize, position: usize| match orientation {
-        Orientation::Vertical => line * width + position,
-        Orientation::Horizontal => position * width + line,
-    };
+    // One node per participating pixel.
+    let mut node_of = vec![usize::MAX; state.len()];
+    let mut nodes = 0usize;
+    let (mut has_a, mut has_b) = (false, false);
+    for (index, cell) in state.iter().enumerate() {
+        match cell {
+            Cell::Absent => continue,
+            Cell::OnlyA => has_a = true,
+            Cell::OnlyB => has_b = true,
+            Cell::Both => {}
+        }
+        node_of[index] = nodes;
+        nodes += 1;
+    }
+    // With only one terminal represented there is nothing to separate, and the
+    // caller should keep whatever it already had.
+    if nodes == 0 || !has_a || !has_b {
+        return None;
+    }
 
-    let infinity = f32::INFINITY;
-    let mut totals = vec![infinity; lines * positions];
-    let mut came_from = vec![usize::MAX; lines * positions];
+    // Normalize so capacities land in a predictable range, which lets the
+    // hard-link weight below be a safe finite number rather than an infinity
+    // that could swamp the arithmetic.
+    let peak = cost
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0f32, f32::max)
+        .max(f32::MIN_POSITIVE);
 
-    let mut any_valid = false;
-    for position in 0..positions {
-        if valid[at(0, position)] {
-            totals[position] = cost[at(0, position)];
-            any_valid = true;
+    // A neighbour edge costs at most 2 after normalization, and the cut can
+    // sever at most two edges per node, so this exceeds any possible cut and
+    // therefore cannot itself be cut.
+    let anchor = 4.0 * nodes as f32 + 16.0;
+
+    let mut graph = Graph::new(nodes, nodes * 2);
+    for (index, cell) in state.iter().enumerate() {
+        let node = node_of[index];
+        if node == usize::MAX {
+            continue;
+        }
+        match cell {
+            Cell::OnlyA => graph.add_terminal_weights(node, anchor, 0.0),
+            Cell::OnlyB => graph.add_terminal_weights(node, 0.0, anchor),
+            _ => {}
         }
     }
-    if !any_valid {
-        return None;
-    }
 
-    for line in 1..lines {
-        let mut line_reachable = false;
-        for position in 0..positions {
-            if !valid[at(line, position)] {
+    // 4-connected edges. Capacity is the summed disagreement at both ends, so
+    // the cut prefers to run where the passes already look alike.
+    let normalized = |index: usize| {
+        let value = cost[index];
+        if value.is_finite() {
+            (value / peak).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let node = node_of[index];
+            if node == usize::MAX {
                 continue;
             }
-            let mut best = infinity;
-            let mut best_previous = usize::MAX;
-            for step in -MAX_STEP..=MAX_STEP {
-                let previous = position as isize + step;
-                if previous < 0 || previous >= positions as isize {
+            for (nx, ny) in [(x + 1, y), (x, y + 1)] {
+                if nx >= width || ny >= height {
                     continue;
                 }
-                let previous = previous as usize;
-                let carried = totals[(line - 1) * positions + previous];
-                if carried == infinity {
+                let neighbour_index = ny * width + nx;
+                let neighbour = node_of[neighbour_index];
+                if neighbour == usize::MAX {
                     continue;
                 }
-                let candidate = carried + STEP_PENALTY * step.unsigned_abs() as f32;
-                if candidate < best {
-                    best = candidate;
-                    best_previous = previous;
-                }
+                // A floor keeps every edge cuttable but non-free, so the cut
+                // stays connected rather than wandering through zero-cost voids.
+                let capacity = normalized(index) + normalized(neighbour_index) + 1e-3;
+                graph.add_edge(node, neighbour, capacity, capacity);
             }
-            if best_previous != usize::MAX {
-                totals[line * positions + position] = best + cost[at(line, position)];
-                came_from[line * positions + position] = best_previous;
-                line_reachable = true;
-            }
-        }
-        // A line the seam cannot reach means the overlap is broken in two.
-        if !line_reachable {
-            return None;
         }
     }
 
-    let last = lines - 1;
-    let mut end = usize::MAX;
-    let mut best = infinity;
-    for position in 0..positions {
-        let total = totals[last * positions + position];
-        if total < best {
-            best = total;
-            end = position;
-        }
-    }
-    if end == usize::MAX {
-        return None;
-    }
+    graph.maxflow();
 
-    let mut path = vec![0usize; lines];
-    let mut position = end;
-    for line in (0..lines).rev() {
-        path[line] = position;
-        if line > 0 {
-            position = came_from[line * positions + position];
-            if position == usize::MAX {
-                return None;
-            }
+    let mut owned_by_a = vec![false; state.len()];
+    for (index, slot) in owned_by_a.iter_mut().enumerate() {
+        let node = node_of[index];
+        if node != usize::MAX {
+            *slot = graph.is_source_side(node);
         }
     }
-    Some(path)
+    Some(owned_by_a)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A cheap channel down one column, everything else expensive: the seam
-    /// should follow the channel exactly.
-    #[test]
-    fn follows_a_straight_low_cost_channel() {
-        let (w, h) = (9usize, 12usize);
-        let mut cost = vec![100.0f32; w * h];
-        for y in 0..h {
-            cost[y * w + 4] = 0.0;
+    /// Build a region that is `OnlyA` down the left edge, `OnlyB` down the
+    /// right, and `Both` in between — the shape a real overlap has.
+    fn strip(width: usize, height: usize, margin: usize) -> Vec<Cell> {
+        let mut state = vec![Cell::Both; width * height];
+        for y in 0..height {
+            for x in 0..margin {
+                state[y * width + x] = Cell::OnlyA;
+                state[y * width + (width - 1 - x)] = Cell::OnlyB;
+            }
         }
-
-        let path = min_cost_path(&cost, &vec![true; w * h], w, h, Orientation::Vertical).unwrap();
-
-        assert_eq!(path.len(), h);
-        assert!(path.iter().all(|&x| x == 4), "path strayed: {path:?}");
+        state
     }
 
-    /// The point of the whole module: when the cheap route bends, the seam
-    /// bends with it instead of cutting straight.
-    #[test]
-    fn follows_a_diagonal_channel_rather_than_going_straight() {
-        let (w, h) = (16usize, 12usize);
-        let mut cost = vec![100.0f32; w * h];
-        for y in 0..h {
-            // A channel drifting right one pixel per row.
-            cost[y * w + (2 + y)] = 0.0;
-        }
-
-        let path = min_cost_path(&cost, &vec![true; w * h], w, h, Orientation::Vertical).unwrap();
-
-        for (y, &x) in path.iter().enumerate() {
-            assert_eq!(x, 2 + y, "row {y} left the channel");
-        }
-        assert!(
-            path.first() != path.last(),
-            "a straight path means the seam is not content-aware"
-        );
+    /// Where in each row the ownership flips from A to B.
+    fn boundary_per_row(owned: &[bool], width: usize, height: usize) -> Vec<usize> {
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .find(|&x| !owned[y * width + x])
+                    .unwrap_or(width)
+            })
+            .collect()
     }
 
-    /// Sideways movement is capped, so a channel that jumps further than
-    /// MAX_STEP in one row cannot be followed exactly — the seam should still
-    /// return a usable path rather than failing.
     #[test]
-    fn survives_a_channel_that_jumps_further_than_one_step() {
-        let (w, h) = (20usize, 6usize);
-        let mut cost = vec![10.0f32; w * h];
-        for y in 0..h {
-            cost[y * w + if y < 3 { 2 } else { 17 }] = 0.0;
-        }
+    fn anchors_are_respected() {
+        let (w, h) = (24usize, 16usize);
+        let state = strip(w, h, 4);
+        let cost = vec![1.0f32; w * h];
 
-        let path = min_cost_path(&cost, &vec![true; w * h], w, h, Orientation::Vertical).unwrap();
-        assert_eq!(path.len(), h);
-        for window in path.windows(2) {
+        let owned = cut_ownership(&state, &cost, w, h).unwrap();
+
+        for y in 0..h {
+            assert!(owned[y * w], "left edge should stay with the first pass");
             assert!(
-                window[1].abs_diff(window[0]) <= MAX_STEP as usize,
-                "path stepped further than allowed: {path:?}"
+                !owned[y * w + (w - 1)],
+                "right edge should stay with the second pass"
             );
         }
     }
 
+    /// The whole point: given a cheap path that bends, the seam follows it
+    /// rather than cutting straight across.
     #[test]
-    fn horizontal_orientation_walks_columns() {
-        let (w, h) = (12usize, 9usize);
-        let mut cost = vec![100.0f32; w * h];
-        for x in 0..w {
-            cost[3 * w + x] = 0.0;
+    fn seam_follows_a_bent_low_cost_path() {
+        let (w, h) = (40usize, 24usize);
+        let state = strip(w, h, 4);
+
+        // Expensive everywhere, except a connected corridor that runs down
+        // x=10, jogs right at the midpoint, then continues down x=28.
+        //
+        // The corridor has to be two pixels wide and actually joined up. An
+        // edge's capacity is the cost at *both* its endpoints, so a one-pixel
+        // channel leaves every crossing edge costing the same as one through
+        // open ground — and then bending only adds the step edges, making the
+        // straight cut correctly cheaper. That is a badly built test, not a
+        // seam finder that ignores content.
+        let mut cost = vec![10.0f32; w * h];
+        let mid = h / 2;
+        let mut make_cheap = |x: usize, y: usize| cost[y * w + x] = 0.0;
+        for y in 0..mid {
+            make_cheap(10, y);
+            make_cheap(11, y);
+        }
+        for y in mid..h {
+            make_cheap(28, y);
+            make_cheap(29, y);
+        }
+        for x in 10..=29 {
+            make_cheap(x, mid);
+            make_cheap(x, mid.saturating_sub(1));
         }
 
-        let path = min_cost_path(&cost, &vec![true; w * h], w, h, Orientation::Horizontal).unwrap();
+        let owned = cut_ownership(&state, &cost, w, h).unwrap();
+        let boundary = boundary_per_row(&owned, w, h);
 
-        assert_eq!(path.len(), w);
-        assert!(path.iter().all(|&y| y == 3), "path strayed: {path:?}");
+        let top = boundary[2];
+        let bottom = boundary[h - 3];
+        assert!(
+            (9..=12).contains(&top),
+            "top of the seam at {top}, expected near the x=10 channel"
+        );
+        assert!(
+            (27..=30).contains(&bottom),
+            "bottom of the seam at {bottom}, expected near the x=28 channel"
+        );
+        assert!(
+            bottom > top + 10,
+            "seam ran straight ({top} -> {bottom}); it is not following content"
+        );
     }
 
+    /// With uniform cost the cut is free to sit anywhere, but it must still be
+    /// a single connected boundary rather than salt and pepper.
     #[test]
-    fn respects_the_valid_mask() {
-        let (w, h) = (8usize, 8usize);
+    fn uniform_cost_still_yields_one_contiguous_region_per_pass() {
+        let (w, h) = (24usize, 16usize);
+        let state = strip(w, h, 4);
         let cost = vec![1.0f32; w * h];
-        // Only the right half may be crossed.
-        let valid: Vec<bool> = (0..w * h).map(|i| i % w >= 4).collect();
 
-        let path = min_cost_path(&cost, &valid, w, h, Orientation::Vertical).unwrap();
-        assert!(path.iter().all(|&x| x >= 4), "seam left the overlap: {path:?}");
-    }
+        let owned = cut_ownership(&state, &cost, w, h).unwrap();
 
-    #[test]
-    fn reports_failure_when_a_line_is_unreachable() {
-        let (w, h) = (8usize, 8usize);
-        let cost = vec![1.0f32; w * h];
-        let mut valid = vec![true; w * h];
-        // Block an entire row: nothing can cross it.
-        for x in 0..w {
-            valid[4 * w + x] = false;
+        for y in 0..h {
+            // Once ownership flips to B along a row it must not flip back.
+            let mut seen_b = false;
+            for x in 0..w {
+                if !owned[y * w + x] {
+                    seen_b = true;
+                } else {
+                    assert!(!seen_b, "row {y} flipped back to A at x={x}");
+                }
+            }
         }
-
-        assert!(min_cost_path(&cost, &valid, w, h, Orientation::Vertical).is_none());
     }
 
     #[test]
-    fn rejects_malformed_input() {
-        assert!(min_cost_path(&[], &[], 0, 0, Orientation::Vertical).is_none());
-        assert!(min_cost_path(&[1.0], &[true, true], 1, 1, Orientation::Vertical).is_none());
+    fn absent_pixels_get_no_ownership() {
+        let (w, h) = (12usize, 8usize);
+        let mut state = strip(w, h, 3);
+        // Punch a hole a third pass owns.
+        for y in 2..5 {
+            for x in 5..8 {
+                state[y * w + x] = Cell::Absent;
+            }
+        }
+        let cost = vec![1.0f32; w * h];
+
+        let owned = cut_ownership(&state, &cost, w, h).unwrap();
+
+        for y in 2..5 {
+            for x in 5..8 {
+                assert!(!owned[y * w + x], "absent pixel was claimed");
+            }
+        }
+    }
+
+    /// Without both anchors there is nothing to separate, and the caller should
+    /// be told so rather than handed a meaningless all-one-side answer.
+    #[test]
+    fn regions_missing_an_anchor_are_refused() {
+        let (w, h) = (8usize, 8usize);
+        let cost = vec![1.0f32; w * h];
+
+        let all_both = vec![Cell::Both; w * h];
+        assert!(cut_ownership(&all_both, &cost, w, h).is_none());
+
+        let mut only_a = vec![Cell::Both; w * h];
+        only_a[0] = Cell::OnlyA;
+        assert!(cut_ownership(&only_a, &cost, w, h).is_none());
+    }
+
+    #[test]
+    fn malformed_input_is_refused() {
+        assert!(cut_ownership(&[], &[], 0, 0).is_none());
+        assert!(cut_ownership(&[Cell::Both], &[1.0, 2.0], 1, 1).is_none());
+        assert!(cut_ownership(&[Cell::Both], &[1.0], 2, 3).is_none());
+    }
+
+    /// Costs that are not finite must not poison the capacities.
+    #[test]
+    fn non_finite_costs_are_tolerated() {
+        let (w, h) = (16usize, 10usize);
+        let state = strip(w, h, 3);
+        let mut cost = vec![1.0f32; w * h];
+        cost[5 * w + 8] = f32::NAN;
+        cost[6 * w + 8] = f32::INFINITY;
+
+        let owned = cut_ownership(&state, &cost, w, h).unwrap();
+        assert!(owned[5 * w], "anchors should still hold");
     }
 }
