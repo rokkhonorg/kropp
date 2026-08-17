@@ -58,6 +58,11 @@ pub struct MergeReport {
     pub masked_features: bool,
     /// How many passes were detected concurrently.
     pub detection_jobs: usize,
+    /// Size the first pass was actually detected at, and the RANSAC gate that
+    /// reduction implied. Both are worth seeing: the gate is what decides
+    /// which correspondences count, and it widens as detection coarsens.
+    pub detection_size: (u32, u32),
+    pub inlier_threshold: f64,
     /// Wall-clock per stage, in the order they ran. Printed under `--debug`;
     /// the only way to tell which stage a slow merge is actually spending its
     /// time in, since the costs are wildly uneven and not where you would guess.
@@ -219,14 +224,25 @@ fn detect_all(
     passes: &[&DynamicImage],
     masks: Option<&[Vec<bool>]>,
     jobs: usize,
+    detect_megapixels: f64,
 ) -> Vec<features::Features> {
     let detect_one = |index: usize| {
         let pass = passes[index];
-        let luma = features::detection_luma(pass);
-        let limit = Some(features::feature_limit(pass.width(), pass.height()));
+        let target = features::detection_target(pass, detect_megapixels);
+        // The feature budget is a density, so it follows the resolution
+        // actually detected on. Asking for a full-resolution count on a
+        // reduced copy would crowd keypoints far past what the detail supports.
+        let limit = Some(features::feature_limit(
+            target.luma.width(),
+            target.luma.height(),
+        ));
+        let mut found = features::detect(&target.luma, limit);
+        features::rescale(&mut found, target.scale);
         match masks {
-            Some(masks) => features::detect_masked(&luma, &masks[index], limit),
-            None => features::detect(&luma, limit),
+            // Masking happens after rescaling, against the full-resolution
+            // mask the extractor produced.
+            Some(masks) => features::apply_mask(found, &masks[index], pass.width(), pass.height()),
+            None => found,
         }
     };
 
@@ -305,6 +321,7 @@ pub fn merge(
     passes: &[&DynamicImage],
     masks: Option<&[Vec<bool>]>,
     jobs: usize,
+    detect_megapixels: f64,
 ) -> Result<Merged> {
     if passes.len() < 2 {
         bail!("a merge needs at least two passes");
@@ -327,10 +344,31 @@ pub fn merge(
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
     let jobs = detection_jobs(&sizes, jobs);
     let features: Vec<features::Features> =
-        timed(&mut timings, "detecting features", || detect_all(passes, masks, jobs));
+        timed(&mut timings, "detecting features", || {
+            detect_all(passes, masks, jobs, detect_megapixels)
+        });
 
+    // Keypoints found on a reduced copy localize to about a pixel there, which
+    // is that many full-resolution pixels once read back. Holding RANSAC to a
+    // fixed 3 px of full-resolution error would then reject correspondences
+    // that are as good as the detection can possibly be, and starve the fit of
+    // exactly the inliers it needs — so the gate widens with the reduction.
+    let error_factor = passes
+        .iter()
+        .map(|pass| features::detection_target(pass, detect_megapixels).error_factor())
+        .fold(1.0f64, f64::max);
+    let ransac = matching::RansacParams {
+        inlier_threshold: matching::DEFAULT_INLIER_THRESHOLD * error_factor,
+        ..Default::default()
+    };
     let alignment = timed(&mut timings, "aligning passes", || {
-        align::align_with_defaults(&features, &sizes)
+        align::align(
+            &features,
+            &sizes,
+            align::DEFAULT_CONFIDENCE_THRESHOLD,
+            matching::DEFAULT_MATCH_CONF,
+            ransac,
+        )
     })?;
     let members: Vec<&DynamicImage> = alignment.members.iter().map(|&m| passes[m]).collect();
     let composed = composite::composite(
@@ -358,6 +396,11 @@ pub fn merge(
             levels: composed.levels,
             masked_features: masks.is_some(),
             detection_jobs: jobs,
+            detection_size: {
+                let target = features::detection_target(passes[0], detect_megapixels);
+                (target.luma.width(), target.luma.height())
+            },
+            inlier_threshold: ransac.inlier_threshold,
             timings,
         },
         members: alignment.members,
@@ -374,7 +417,7 @@ mod tests {
     fn a_group_wider_than_the_coverage_mask_is_refused() {
         let pass = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
         let refs: Vec<&DynamicImage> = (0..composite::MAX_PASSES + 1).map(|_| &pass).collect();
-        let Err(error) = merge(&refs, None, 1) else {
+        let Err(error) = merge(&refs, None, 1, 0.0) else {
             panic!("a group of {} passes should be refused", refs.len());
         };
         assert!(

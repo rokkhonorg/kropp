@@ -5,6 +5,7 @@
 //! direct ndarray dependency — the descriptor array is read through inherent
 //! methods and converted immediately.
 
+use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage};
 
 use super::geometry::Point;
@@ -67,6 +68,70 @@ pub fn detection_luma(image: &DynamicImage) -> GrayImage {
     image.to_luma8()
 }
 
+/// A pass reduced for detection, and what it takes to read its coordinates as
+/// full-resolution ones again.
+pub struct Detection {
+    pub luma: GrayImage,
+    /// Multiply a detection-space coordinate by these to get a full-resolution
+    /// one. Held per axis, and derived from the rounded output dimensions, so
+    /// the mapping back is exact rather than off by the rounding.
+    pub scale: (f64, f64),
+}
+
+impl Detection {
+    /// Whether detection ran on a reduced copy at all.
+    pub fn reduced(&self) -> bool {
+        self.scale.0 != 1.0 || self.scale.1 != 1.0
+    }
+
+    /// The larger of the two axis factors — how much a keypoint's localization
+    /// error is magnified when read at full resolution.
+    pub fn error_factor(&self) -> f64 {
+        self.scale.0.max(self.scale.1)
+    }
+}
+
+/// Flatten a pass and shrink it to about `target_megapixels` for detection.
+///
+/// Detection dominates a merge, and its cost is proportional to area, so this
+/// is the one lever that really moves it. What makes it affordable is that the
+/// alignment is four numbers fitted to hundreds of correspondences: individual
+/// keypoints get coarser, but averaging over that many recovers a transform far
+/// more accurate than any one of them. The previous OpenCV implementation
+/// registered at 0.6 MP and its transforms matched full-resolution ones to
+/// sub-pixel translations.
+///
+/// A target of zero (or one no smaller than the pass) detects at full size.
+pub fn detection_target(image: &DynamicImage, target_megapixels: f64) -> Detection {
+    let luma = image.to_luma8();
+    let (width, height) = (luma.width(), luma.height());
+    let pixels = width as f64 * height as f64;
+    let target = target_megapixels * 1_000_000.0;
+
+    if target <= 0.0 || pixels <= target || width == 0 || height == 0 {
+        return Detection {
+            luma,
+            scale: (1.0, 1.0),
+        };
+    }
+
+    let factor = (pixels / target).sqrt();
+    let small_width = ((width as f64 / factor).round() as u32).max(1);
+    let small_height = ((height as f64 / factor).round() as u32).max(1);
+    // Triangle, not Nearest: dropping samples outright would alias scan grain
+    // into exactly the corner-like structure SIFT keys on, and those keypoints
+    // would be artifacts of the resampling rather than of the document.
+    let small = image::imageops::resize(&luma, small_width, small_height, FilterType::Triangle);
+
+    Detection {
+        scale: (
+            width as f64 / small_width as f64,
+            height as f64 / small_height as f64,
+        ),
+        luma: small,
+    }
+}
+
 /// Detect SIFT features over the whole image.
 pub fn detect(image: &GrayImage, limit: Option<usize>) -> Features {
     // SIFT builds a scale-space pyramid; a degenerate image has nothing to
@@ -100,8 +165,19 @@ pub fn detect(image: &GrayImage, limit: Option<usize>) -> Features {
     }
 }
 
-/// Detect features, then keep only those landing on a set pixel of `mask`
-/// (row-major, `image` sized).
+/// Read detection-space keypoints as full-resolution ones, in place.
+pub fn rescale(features: &mut Features, scale: (f64, f64)) {
+    if scale == (1.0, 1.0) {
+        return;
+    }
+    for point in &mut features.points {
+        point.0 *= scale.0;
+        point.1 *= scale.1;
+    }
+}
+
+/// Keep only the features landing on a set pixel of `mask` (row-major,
+/// `width` x `height`, in the same coordinates as `features`).
 ///
 /// This is what keeps platen artifacts out of the alignment. Bed edges, dust,
 /// and lid shadow sit at *fixed* positions in scanner coordinates, so they are
@@ -110,9 +186,8 @@ pub fn detect(image: &GrayImage, limit: Option<usize>) -> Features {
 /// keypoints to the extracted object removes them before they can vote.
 ///
 /// A mask whose length disagrees with the image is ignored rather than trusted.
-pub fn detect_masked(image: &GrayImage, mask: &[bool], limit: Option<usize>) -> Features {
-    let features = detect(image, limit);
-    let (w, h) = (image.width() as usize, image.height() as usize);
+pub fn apply_mask(features: Features, mask: &[bool], width: u32, height: u32) -> Features {
+    let (w, h) = (width as usize, height as usize);
     if mask.len() != w * h {
         return features;
     }
@@ -157,6 +232,59 @@ mod tests {
         );
         assert_eq!(features.points.len(), features.descriptors.len());
         assert!(features.len() <= DEFAULT_FEATURE_LIMIT);
+    }
+
+    /// Zero, and any target the pass already meets, must leave it alone —
+    /// that is how `--merge-detect-mp 0` turns the reduction off.
+    #[test]
+    fn a_target_of_zero_or_larger_than_the_pass_detects_at_full_size() {
+        let pass = DynamicImage::ImageLuma8(master_texture(400, 300));
+        for target in [0.0, -1.0, 5.0] {
+            let detection = detection_target(&pass, target);
+            assert!(!detection.reduced(), "target {target} should not reduce");
+            assert_eq!(detection.luma.dimensions(), (400, 300));
+            assert_eq!(detection.scale, (1.0, 1.0));
+        }
+    }
+
+    /// The reduced copy lands near the requested size, and its scale factors
+    /// map coordinates back exactly — they come from the rounded dimensions,
+    /// not from the ratio that produced them.
+    #[test]
+    fn reduction_hits_the_target_and_maps_coordinates_back_exactly() {
+        let pass = DynamicImage::ImageLuma8(master_texture(4000, 3000));
+        let detection = detection_target(&pass, 1.0);
+
+        let (w, h) = detection.luma.dimensions();
+        let megapixels = w as f64 * h as f64 / 1e6;
+        assert!(
+            (0.9..1.1).contains(&megapixels),
+            "expected about 1 MP, got {megapixels:.3} ({w}x{h})"
+        );
+        assert!(detection.reduced());
+
+        // A corner of the reduced copy must map to the corner of the original.
+        assert!((w as f64 * detection.scale.0 - 4000.0).abs() < 1e-9);
+        assert!((h as f64 * detection.scale.1 - 3000.0).abs() < 1e-9);
+        assert!(detection.error_factor() > 1.0);
+    }
+
+    /// Keypoints found on the reduced copy have to come back as
+    /// full-resolution coordinates, or every stage downstream is wrong by the
+    /// reduction factor.
+    #[test]
+    fn rescaling_moves_keypoints_into_full_resolution_coordinates() {
+        let mut features = Features {
+            points: vec![(10.0, 20.0), (0.0, 0.0)],
+            descriptors: vec![[0u8; DESCRIPTOR_LEN]; 2],
+        };
+        rescale(&mut features, (4.0, 3.0));
+        assert_eq!(features.points, vec![(40.0, 60.0), (0.0, 0.0)]);
+
+        // An identity scale must not perturb anything.
+        let mut untouched = features.clone();
+        rescale(&mut untouched, (1.0, 1.0));
+        assert_eq!(untouched.points, features.points);
     }
 
     #[test]
@@ -224,7 +352,7 @@ mod tests {
         }
 
         let all = detect(&img, None);
-        let masked = detect_masked(&img, &mask, None);
+        let masked = apply_mask(detect(&img, None), &mask, img.width(), img.height());
 
         assert!(masked.len() < all.len(), "mask did not remove anything");
         assert!(!masked.is_empty(), "mask removed everything");
@@ -239,7 +367,7 @@ mod tests {
     fn wrongly_sized_mask_is_ignored() {
         let img = master_texture(120, 120);
         let all = detect(&img, None);
-        let masked = detect_masked(&img, &[true; 10], None);
+        let masked = apply_mask(detect(&img, None), &[true; 10], img.width(), img.height());
 
         assert_eq!(masked.len(), all.len());
     }

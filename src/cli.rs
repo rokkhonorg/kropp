@@ -139,6 +139,17 @@ pub struct Args {
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub merge_jobs: usize,
 
+    /// Megapixels to detect merge features at. Passes are shrunk to roughly
+    /// this size before SIFT runs, which is what keeps detection — by far the
+    /// slowest stage of a merge — affordable at scan resolution. The alignment
+    /// is four numbers fitted to hundreds of correspondences, so averaging
+    /// recovers a transform far more accurate than any single keypoint: on a
+    /// four-pass set the default agrees with full-resolution detection to
+    /// 0.02 degrees while detecting nearly 13x faster.
+    /// Set to 0 to detect at full resolution.
+    #[arg(long, value_name = "MP", default_value_t = 2.5, verbatim_doc_comment)]
+    pub merge_detect_mp: f64,
+
     /// Write the merged image to this exact path instead of the default
     /// `<stem>_merged.<ext>`, and keep it. Only valid with a single merge
     /// group. Crops are still written next to it with `_<index>` suffixes.

@@ -99,6 +99,7 @@ For per-stage timings rather than a live line, use `--debug`.
 | `--keep-merged` | off | Keep the merged image next to the crops |
 | `--merge-mask-features` | off | Confine merge keypoints to the extracted foreground |
 | `--merge-jobs` | auto | How many passes to detect features on at once (see [Merge speed and memory](#merge-speed-and-memory)) |
+| `--merge-detect-mp` | `2.5` | Megapixels to detect merge features at; `0` detects at full resolution |
 | `-t, --threshold` | `95` | Alpha cutoff %: below this is transparent, at/above is kept |
 | `-m, --min-area` | `0` | Drop objects smaller than this many pixels |
 | `--min-side-percent` | `10` | Drop objects whose longer side is under this % of the smaller image dimension |
@@ -214,20 +215,40 @@ extraction pass per input.
 
 ### Merge speed and memory
 
-Feature detection dominates a merge — around three quarters of its time, far
-more than the alignment or the blending — and it is also the memory
-high-water mark, needing several gigabytes of scale space per pass at full
-platen resolution. Passes are therefore detected in parallel, but only as many
-at once as memory allows: kropp asks the OS how much is free, divides by what
-a pass of that size implies, and keeps a margin for everything else.
+Feature detection dominates a merge, and its cost is proportional to area, so
+passes are shrunk to about **2.5 megapixels** before SIFT runs. Nothing else is
+downscaled — the compositor still warps and blends from the original samples at
+full bit depth. Only the search for keypoints happens on a reduced copy, and
+their coordinates are scaled back up before anything is fitted.
 
-On a four-pass group of 35-megapixel scans that works out at all four at once
-on a large machine, and one at a time on a small one. `--merge-jobs N` sets the
-count explicitly if you would rather decide yourself; `--debug` reports which
-count was chosen along with the per-stage timings.
+This is affordable because the alignment is four numbers fitted to hundreds of
+correspondences. Individual keypoints do get coarser, but averaging over that
+many recovers a transform far more accurate than any one of them. Measured on a
+four-pass set of 35-megapixel scans, against detecting at full resolution:
 
-Raising it past what memory supports is counterproductive — swapping costs far
-more than the parallelism saves.
+| `--merge-detect-mp` | detect | whole merge | agreement with full res |
+| --- | --- | --- | --- |
+| `0` (full) | 17.6s | 26.8s | — |
+| 5.0 | 2.7s | 12.2s | 0.029° |
+| **2.5** (default) | **1.4s** | **9.8s** | **0.023°** |
+| 1.2 | 0.8s | 9.0s | 0.016° |
+| 0.6 | 0.5s | 8.5s | 0.016°, crop 0.18% smaller |
+
+Below about 1.2 MP the fitted rotations stay just as close but the merge starts
+losing a little coverage at its edges, and there is almost nothing left to save
+— by then blending, not detection, is the slowest stage. The default sits at
+twice that margin. Raise it, or pass `0`, if you would rather spend the time
+than wonder; there is no quality reason to lower it.
+
+Detection is also the memory high-water mark, needing gigabytes of scale space
+per pass, so passes are detected in parallel but only as many at once as memory
+allows: kropp asks the OS how much is free, divides by what a pass of that size
+implies, and keeps a margin for everything else. `--merge-jobs N` sets the count
+explicitly; `--debug` reports the count chosen, the resolution detected at, and
+the per-stage timings.
+
+Raising the job count past what memory supports is counterproductive — swapping
+costs far more than the parallelism saves.
 
 ### Inspecting a merge
 

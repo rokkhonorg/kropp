@@ -201,11 +201,46 @@ impl Rng {
     }
 }
 
-/// OpenCV's pairwise confidence, including its cap: a score above 3 means the
-/// images are near-duplicates rather than genuine neighbours, and is zeroed.
-fn confidence(inliers: usize, total_matches: usize) -> f64 {
+/// How near identity a fit must be to be a duplicate rather than a
+/// neighbouring pass. Passes off one platen are displaced by hundreds of
+/// pixels at least; nothing legitimate lands this close to no movement at all.
+const DUPLICATE_DISPLACEMENT: f64 = 16.0;
+const DUPLICATE_ROTATION: f64 = 0.01;
+const DUPLICATE_SCALE: f64 = 1e-3;
+
+/// Whether a fit says the two passes are the same picture in the same place.
+///
+/// Either they are literally the same scan twice, or the correspondences that
+/// carried the fit are platen artifacts — bed edges, dust, lid shadow — which
+/// sit at identical scanner coordinates in every pass and so match each other
+/// perfectly at zero displacement. Neither says anything about where the passes
+/// belong.
+fn is_near_identity(transform: Similarity) -> bool {
+    transform.tx.hypot(transform.ty) < DUPLICATE_DISPLACEMENT
+        && transform.theta.abs() < DUPLICATE_ROTATION
+        && (transform.scale - 1.0).abs() < DUPLICATE_SCALE
+}
+
+/// OpenCV's pairwise confidence, and its near-duplicate cap.
+///
+/// OpenCV zeroes any score above 3 outright, reading it as two images of the
+/// same thing from the same place. That is right in intent and too blunt in
+/// practice: the score rises with the inlier *ratio*, and a fit can earn a
+/// ratio that high honestly. It does so exactly when detection runs on a
+/// reduced copy — the inlier gate widens to match the coarser keypoints, so
+/// nearly every proposed match agrees, and pairs whose transforms are correct
+/// to a fraction of a pixel get scored zero and thrown away. That put a false
+/// floor under how far detection could usefully be reduced.
+///
+/// So the cap still fires, but only on a fit that actually looks like a
+/// duplicate: one that barely moves anything.
+fn confidence(inliers: usize, total_matches: usize, transform: Similarity) -> f64 {
     let raw = inliers as f64 / (8.0 + 0.3 * total_matches as f64);
-    if raw > 3.0 { 0.0 } else { raw }
+    if raw > 3.0 && is_near_identity(transform) {
+        0.0
+    } else {
+        raw
+    }
 }
 
 /// Fit a similarity to `correspondences` by RANSAC, then refit on the consensus
@@ -223,9 +258,9 @@ pub fn robust_estimate(
     if correspondences.len() == 2 {
         let transform = geometry::estimate(correspondences, params.scale_model)?;
         return Some(RobustFit {
+            confidence: confidence(2, 2, transform),
             transform,
             inliers: vec![0, 1],
-            confidence: confidence(2, 2),
         });
     }
 
@@ -273,7 +308,7 @@ pub fn robust_estimate(
     let consensus: Vec<(Point, Point)> = best_inliers.iter().map(|&i| correspondences[i]).collect();
     let transform = geometry::estimate(&consensus, params.scale_model)?;
     Some(RobustFit {
-        confidence: confidence(best_inliers.len(), correspondences.len()),
+        confidence: confidence(best_inliers.len(), correspondences.len(), transform),
         transform,
         inliers: best_inliers,
     })
@@ -509,8 +544,46 @@ mod tests {
     /// above 3 so an image never matches itself into the graph.
     #[test]
     fn confidence_matches_opencv_formula_and_cap() {
-        assert!((confidence(20, 40) - 20.0 / (8.0 + 12.0)).abs() < 1e-12);
-        assert_eq!(confidence(1000, 1), 0.0, "near-duplicate cap should fire");
+        let moved = Similarity::translation(900.0, 40.0);
+        assert!((confidence(20, 40, moved) - 20.0 / (8.0 + 12.0)).abs() < 1e-12);
+        assert_eq!(
+            confidence(1000, 1, Similarity::IDENTITY),
+            0.0,
+            "near-duplicate cap should fire on a fit that moves nothing"
+        );
+    }
+
+    /// The cap must not punish a pair for fitting well. A genuine neighbour
+    /// displaced across the platen keeps its score however high the inlier
+    /// ratio climbs — which is what coarse detection drives it to, and what
+    /// used to have well-aligned pairs discarded.
+    #[test]
+    fn a_confident_but_displaced_pair_is_not_taken_for_a_duplicate() {
+        let neighbour = Similarity::translation(1308.0, -67.0);
+        assert!(
+            confidence(1000, 1, neighbour) > 3.0,
+            "a displaced pair should keep a high score"
+        );
+    }
+
+    /// A rotation or a scale on the spot is still movement, so only a fit that
+    /// is identity in every component counts as a duplicate.
+    #[test]
+    fn only_an_all_round_identity_counts_as_a_duplicate() {
+        assert!(is_near_identity(Similarity::IDENTITY));
+        assert!(!is_near_identity(Similarity::translation(40.0, 0.0)));
+        assert!(!is_near_identity(Similarity {
+            scale: 1.0,
+            theta: 0.2,
+            tx: 0.0,
+            ty: 0.0,
+        }));
+        assert!(!is_near_identity(Similarity {
+            scale: 1.4,
+            theta: 0.0,
+            tx: 0.0,
+            ty: 0.0,
+        }));
     }
 
     #[test]

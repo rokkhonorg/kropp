@@ -213,6 +213,7 @@ fn process_merge_group(pipeline: &mut Pipeline, passes: &[PathBuf], args: &Args)
         &refs,
         args.merge_mask_features.then_some(masks.as_slice()),
         args.merge_jobs,
+        args.merge_detect_mp,
     )?;
     if args.debug {
         log_merge_report(passes, &merged);
@@ -328,9 +329,19 @@ fn log_merge_report(passes: &[PathBuf], merged: &merge::Merged) {
         ""
     };
     elog!("  features{masked}");
+    let (dw, dh) = report.detection_size;
+    let full = report.passes.first().map(|&((w, h), _)| (w, h));
+    let at = match full {
+        Some((w, h)) if (w, h) != (dw, dh) => format!(
+            "{dw}x{dh} ({:.2} MP, reduced from {w}x{h})",
+            dw as f64 * dh as f64 / 1e6
+        ),
+        _ => format!("{dw}x{dh} (full resolution)"),
+    };
     elog!(
-        "  detection: {} pass(es) at a time",
-        report.detection_jobs
+        "  detection: {at}, {} pass(es) at a time, inliers within {:.1}px",
+        report.detection_jobs,
+        report.inlier_threshold
     );
     elog!("  frame: reference {} (bundle adjusted)", name(report.reference));
     for (slot, &member) in merged.members.iter().enumerate() {
