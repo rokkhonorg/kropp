@@ -33,7 +33,10 @@ use super::seam;
 /// Sampling happens hundreds of millions of times per merge, and through
 /// `dyn Fn` every one of those was an indirect call the bilinear arithmetic
 /// could not be inlined into.
-pub trait Pass {
+///
+/// `Sync` because the warp and the selection read passes from several threads
+/// at once. Sampling only reads, so this costs the implementors nothing.
+pub trait Pass: Sync {
     fn sample(&self, x: f64, y: f64) -> Option<[f32; 3]>;
 }
 
@@ -288,30 +291,32 @@ const MAX_MULTIBAND_PIXELS: u64 = 120_000_000;
 ///
 /// The masks sum to 1 at every covered pixel, which is what lets `blend_channel`
 /// skip per-level renormalization.
-/// One bit per canvas pixel, recording whether a given pass reaches it.
+/// Which passes reach each canvas pixel, one bit per pass.
 ///
-/// Deciding that costs an inverse transform and a bounds test, and later stages
-/// need the same answer for the same pixels. A bit each is 8 MB for a
-/// 60-megapixel canvas, against re-deriving it tens of millions of times.
+/// A single plane of bitmasks rather than a bitset per pass. Deciding coverage
+/// costs an inverse transform and a bounds test, and later stages need the same
+/// answer for the same pixels, so it is worth keeping — but a per-pass bitset
+/// packs 64 pixels into one word, and two threads filling adjacent rows would
+/// then be read-modify-writing the same word. A mask per pixel gives every
+/// banded loop whole elements of its own.
 pub struct Coverage {
-    words: Vec<u64>,
+    bits: Vec<u32>,
 }
 
+/// Passes a `u32` of coverage bits can describe. Far beyond any real merge —
+/// a group is a handful of platen passes of one original — but checked rather
+/// than assumed, since overflowing it would silently lose coverage.
+pub const MAX_PASSES: usize = 32;
+
 impl Coverage {
-    fn new(pixels: usize) -> Self {
-        Self {
-            words: vec![0u64; pixels.div_ceil(64)],
-        }
+    #[inline]
+    pub fn covers(&self, pixel: usize, pass: usize) -> bool {
+        self.bits[pixel] & (1u32 << pass) != 0
     }
 
     #[inline]
-    fn set(&mut self, pixel: usize) {
-        self.words[pixel / 64] |= 1u64 << (pixel % 64);
-    }
-
-    #[inline]
-    pub fn get(&self, pixel: usize) -> bool {
-        self.words[pixel / 64] & (1u64 << (pixel % 64)) != 0
+    pub fn any(&self, pixel: usize) -> bool {
+        self.bits[pixel] != 0
     }
 }
 
@@ -320,49 +325,52 @@ fn selection_masks<P: Pass>(
     passes: &[P],
     canvas_width: u32,
     canvas_height: u32,
-) -> (Vec<Vec<f32>>, Vec<bool>, Vec<u16>, Vec<Coverage>) {
+) -> (Vec<bool>, Vec<u16>, Coverage) {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
-    let mut masks: Vec<Vec<f32>> = places.iter().map(|_| vec![0.0f32; width * height]).collect();
-    let mut coverage = vec![false; width * height];
     // 0 = uncovered, otherwise the owning pass index + 1.
     let mut ownership = vec![0u16; width * height];
-    let mut per_pass: Vec<Coverage> = places
-        .iter()
-        .map(|_| Coverage::new(width * height))
-        .collect();
+    let mut bits = vec![0u32; width * height];
 
-    for y in 0..height {
-        for x in 0..width {
-            let flat = y * width + x;
-            let (mut best, mut best_weight) = (usize::MAX, 0.0f32);
-            for (index, place) in places.iter().enumerate() {
-                let (sx, sy) = place.inverse.apply((x as f64, y as f64));
-                // Recorded against `covers`, deliberately not against
-                // `covered_by`. The two disagree on the outermost half-pixel —
-                // a sampler still interpolates at `w - 0.5`, where `covers`
-                // has already stopped — and the consumers of this bitmap are
-                // the ones that ask `covers`. Both are derived from the same
-                // inverse transform, so keeping them apart is free.
-                if in_bounds(sx, sy, place) {
-                    per_pass[index].set(flat);
+    super::parallel::bands2(
+        &mut ownership,
+        &mut bits,
+        width,
+        height,
+        |first_row, owners, covering| {
+            for (offset, (owner, cover)) in owners.iter_mut().zip(covering.iter_mut()).enumerate() {
+                let slot = first_row * width + offset;
+                let (x, y) = ((slot % width) as f64, (slot / width) as f64);
+
+                let (mut best, mut best_weight) = (usize::MAX, 0.0f32);
+                for (index, place) in places.iter().enumerate() {
+                    let (sx, sy) = place.inverse.apply((x, y));
+                    // Recorded against `covers`, deliberately not against the
+                    // sampler's own bounds. The two disagree on the outermost
+                    // half-pixel — a sampler still interpolates at `w - 0.5`,
+                    // where `covers` has already stopped — and the consumers of
+                    // this plane are the ones that ask `covers`. Both come from
+                    // the same inverse transform, so keeping them apart is free.
+                    if in_bounds(sx, sy, place) {
+                        *cover |= 1u32 << index;
+                    }
+                    if passes[index].sample(sx, sy).is_none() {
+                        continue;
+                    }
+                    let weight = selection_weight(sx, sy, place.width, place.height);
+                    if weight > best_weight {
+                        best_weight = weight;
+                        best = index;
+                    }
                 }
-                if passes[index].sample(sx, sy).is_none() {
-                    continue;
-                }
-                let weight = selection_weight(sx, sy, place.width, place.height);
-                if weight > best_weight {
-                    best_weight = weight;
-                    best = index;
+                if best != usize::MAX {
+                    *owner = best as u16 + 1;
                 }
             }
-            if best != usize::MAX {
-                masks[best][flat] = 1.0;
-                coverage[flat] = true;
-                ownership[flat] = best as u16 + 1;
-            }
-        }
-    }
-    (masks, coverage, ownership, per_pass)
+        },
+    );
+
+    let coverage = ownership.iter().map(|&owner| owner != 0).collect();
+    (coverage, ownership, Coverage { bits })
 }
 
 /// Nodes the seam solve may use. Seam *placement* does not need full
@@ -510,7 +518,7 @@ fn refine_seams<P: Pass>(
 /// kernel over a canvas of tens of megapixels.
 fn soften_masks(
     masks: &mut [Vec<f32>],
-    per_pass: &[Coverage],
+    coverage: &Coverage,
     canvas_width: u32,
     canvas_height: u32,
     stride: usize,
@@ -543,25 +551,28 @@ fn soften_masks(
     // clamped edge pixels to offer. Clip each mask back to its coverage, then
     // restore the sum-to-one that the blender relies on.
     //
-    // Coverage comes from the bitmap `selection_masks` already built. Asking
+    // Coverage comes from the plane `selection_masks` already built. Asking
     // `covers` again would repeat an inverse transform per pass per pixel, for
     // an answer that has not changed.
-    for slot in 0..width * height {
-        let mut total = 0.0f32;
-        for (index, coverage) in per_pass.iter().enumerate() {
-            if !coverage.get(slot) {
-                masks[index][slot] = 0.0;
-            } else {
-                masks[index][slot] = masks[index][slot].max(0.0);
-                total += masks[index][slot];
+    super::parallel::bands_many(masks, width, height, |first, bands| {
+        for offset in 0..bands[0].len() {
+            let slot = first + offset;
+            let mut total = 0.0f32;
+            for (index, mask) in bands.iter_mut().enumerate() {
+                if !coverage.covers(slot, index) {
+                    mask[offset] = 0.0;
+                } else {
+                    mask[offset] = mask[offset].max(0.0);
+                    total += mask[offset];
+                }
+            }
+            if total > 0.0 {
+                for mask in bands.iter_mut() {
+                    mask[offset] /= total;
+                }
             }
         }
-        if total > 0.0 {
-            for mask in masks.iter_mut() {
-                mask[slot] /= total;
-            }
-        }
-    }
+    });
 }
 
 /// Warp one pass onto the canvas, all three channels at once. Uncovered pixels
@@ -581,21 +592,22 @@ fn warp_pass<P: Pass>(
 ) -> [Vec<f32>; 3] {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
     let mut planes: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0f32; width * height]);
-    for y in 0..height {
-        for x in 0..width {
+
+    super::parallel::bands_n(&mut planes, width, height, |first_row, bands| {
+        for offset in 0..bands[0].len() {
+            let (x, y) = (offset % width, first_row + offset / width);
             let (sx, sy) = place.inverse.apply((x as f64, y as f64));
             let clamped = (
                 sx.clamp(0.0, place.width - 1.0),
                 sy.clamp(0.0, place.height - 1.0),
             );
             if let Some(values) = pass.sample(clamped.0, clamped.1) {
-                let slot = y * width + x;
-                planes[0][slot] = values[0];
-                planes[1][slot] = values[1];
-                planes[2][slot] = values[2];
+                bands[0][offset] = values[0];
+                bands[1][offset] = values[1];
+                bands[2][offset] = values[2];
             }
         }
-    }
+    });
     planes
 }
 
@@ -611,7 +623,7 @@ fn composite_planes<P: Pass>(
 ) -> (Vec<Vec<f32>>, Vec<bool>, usize, Vec<u16>) {
     let (width, height) = (canvas_width as usize, canvas_height as usize);
 
-    let (mut masks, coverage, mut ownership, per_pass) = super::timed(timings, "choosing regions", || {
+    let (coverage, mut ownership, covered) = super::timed(timings, "choosing regions", || {
         selection_masks(places, passes, canvas_width, canvas_height)
     });
 
@@ -621,15 +633,21 @@ fn composite_planes<P: Pass>(
     let seam_stride = super::timed(timings, "placing seams", || {
         refine_seams(&mut ownership, places, passes, canvas_width, canvas_height)
     });
-    for (index, mask) in masks.iter_mut().enumerate() {
-        let owner = index as u16 + 1;
-        for (slot, value) in mask.iter_mut().enumerate() {
-            *value = if ownership[slot] == owner { 1.0 } else { 0.0 };
+    // Built here rather than by `selection_masks`, which used to fill them and
+    // then have every element overwritten from `ownership` the moment the cut
+    // had moved it — a whole canvas-sized plane of stores per pass, discarded.
+    let mut masks: Vec<Vec<f32>> = places.iter().map(|_| vec![0.0f32; width * height]).collect();
+    super::parallel::bands_many(&mut masks, width, height, |first, bands| {
+        for (index, mask) in bands.iter_mut().enumerate() {
+            let owner = index as u16 + 1;
+            for (offset, value) in mask.iter_mut().enumerate() {
+                *value = if ownership[first + offset] == owner { 1.0 } else { 0.0 };
+            }
         }
-    }
+    });
     if let Some(stride) = seam_stride {
         super::timed(timings, "softening seams", || {
-            soften_masks(&mut masks, &per_pass, canvas_width, canvas_height, stride)
+            soften_masks(&mut masks, &covered, canvas_width, canvas_height, stride)
         });
     }
 
@@ -955,11 +973,6 @@ mod tests {
     #[test]
     fn softening_spreads_the_boundary_and_preserves_the_sum() {
         let (w, h) = (64usize, 32usize);
-        let places = placements(
-            &[Similarity::IDENTITY, Similarity::IDENTITY],
-            &[(w as u32, h as u32), (w as u32, h as u32)],
-        );
-
         // A hard split down the middle, as the cut hands over.
         let mut masks = vec![vec![0.0f32; w * h], vec![0.0f32; w * h]];
         for y in 0..h {
@@ -972,18 +985,11 @@ mod tests {
 
         // Both passes are identity-placed over the whole canvas, so both cover
         // every pixel.
-        let per_pass: Vec<Coverage> = places
-            .iter()
-            .map(|_| {
-                let mut coverage = Coverage::new(w * h);
-                for slot in 0..w * h {
-                    coverage.set(slot);
-                }
-                coverage
-            })
-            .collect();
+        let covered = Coverage {
+            bits: vec![0b11u32; w * h],
+        };
 
-        soften_masks(&mut masks, &per_pass, w as u32, h as u32, 8);
+        soften_masks(&mut masks, &covered, w as u32, h as u32, 8);
 
         // Sum-to-one holds everywhere both passes cover.
         for (slot, (first, second)) in masks[0].iter().zip(&masks[1]).enumerate() {

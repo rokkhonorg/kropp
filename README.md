@@ -165,7 +165,8 @@ merged image (`<stem>_merged.<ext>`) alongside the crops.
 Passes must **overlap** — the alignment is driven by features found in the
 shared region, and a group whose passes don't overlap is reported rather than
 merged. A pass that overlaps nothing is left out with a warning while the rest
-proceed.
+proceed. A group is at most 32 passes, which is far beyond what a platen-sized
+original needs.
 
 ### How it works
 

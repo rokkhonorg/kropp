@@ -31,53 +31,61 @@ fn clamp_index(value: isize, limit: usize) -> usize {
 /// the innermost loop of the whole merge: every pyramid level of every mask and
 /// every channel of every pass passes through it twice.
 fn blur(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    // Horizontal pass.
+    // Horizontal pass. Every output row is a function of the input row at the
+    // same index alone, so the bands are independent and the arithmetic each
+    // pixel sees is what the serial loop gave it.
     let mut horizontal = vec![0.0f32; w * h];
     // Where the taps `x-2 ..= x+2` are all in range.
     let interior = 2..w.saturating_sub(2);
-    for y in 0..h {
-        let row = &src[y * w..y * w + w];
-        let out = &mut horizontal[y * w..y * w + w];
+    super::parallel::bands(&mut horizontal, w, h, |first_row, band| {
+        for (offset, out) in band.chunks_mut(w).enumerate() {
+            let y = first_row + offset;
+            let row = &src[y * w..y * w + w];
 
-        for x in (0..w).take(2).chain(interior.end.max(2)..w) {
-            let mut total = 0.0;
-            for (tap, weight) in KERNEL.iter().enumerate() {
-                total += row[clamp_index(x as isize + tap as isize - 2, w)] * weight;
+            for x in (0..w).take(2).chain(interior.end.max(2)..w) {
+                let mut total = 0.0;
+                for (tap, weight) in KERNEL.iter().enumerate() {
+                    total += row[clamp_index(x as isize + tap as isize - 2, w)] * weight;
+                }
+                out[x] = total;
             }
-            out[x] = total;
+            for x in interior.clone() {
+                out[x] = row[x - 2] * KERNEL[0]
+                    + row[x - 1] * KERNEL[1]
+                    + row[x] * KERNEL[2]
+                    + row[x + 1] * KERNEL[3]
+                    + row[x + 2] * KERNEL[4];
+            }
         }
-        for x in interior.clone() {
-            out[x] = row[x - 2] * KERNEL[0]
-                + row[x - 1] * KERNEL[1]
-                + row[x] * KERNEL[2]
-                + row[x + 1] * KERNEL[3]
-                + row[x + 2] * KERNEL[4];
-        }
-    }
+    });
 
     // Vertical pass. The five source rows are resolved once per output row
     // rather than once per pixel, so the inner loop is five flat slice reads.
+    // They are reads of a plane nothing is writing to any more, so banding the
+    // output is again a clean split.
     let mut out = vec![0.0f32; w * h];
-    for y in 0..h {
-        let rows: [usize; 5] = std::array::from_fn(|tap| {
-            clamp_index(y as isize + tap as isize - 2, h) * w
-        });
-        let (r0, r1, r2, r3, r4) = (
-            &horizontal[rows[0]..rows[0] + w],
-            &horizontal[rows[1]..rows[1] + w],
-            &horizontal[rows[2]..rows[2] + w],
-            &horizontal[rows[3]..rows[3] + w],
-            &horizontal[rows[4]..rows[4] + w],
-        );
-        let dst = &mut out[y * w..y * w + w];
-        for x in 0..w {
-            dst[x] = r0[x] * KERNEL[0]
-                + r1[x] * KERNEL[1]
-                + r2[x] * KERNEL[2]
-                + r3[x] * KERNEL[3]
-                + r4[x] * KERNEL[4];
+    let horizontal = &horizontal;
+    super::parallel::bands(&mut out, w, h, |first_row, band| {
+        for (offset, dst) in band.chunks_mut(w).enumerate() {
+            let y = first_row + offset;
+            let rows: [usize; 5] =
+                std::array::from_fn(|tap| clamp_index(y as isize + tap as isize - 2, h) * w);
+            let (r0, r1, r2, r3, r4) = (
+                &horizontal[rows[0]..rows[0] + w],
+                &horizontal[rows[1]..rows[1] + w],
+                &horizontal[rows[2]..rows[2] + w],
+                &horizontal[rows[3]..rows[3] + w],
+                &horizontal[rows[4]..rows[4] + w],
+            );
+            for x in 0..w {
+                dst[x] = r0[x] * KERNEL[0]
+                    + r1[x] * KERNEL[1]
+                    + r2[x] * KERNEL[2]
+                    + r3[x] * KERNEL[3]
+                    + r4[x] * KERNEL[4];
+            }
         }
-    }
+    });
     out
 }
 

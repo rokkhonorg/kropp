@@ -35,6 +35,7 @@ pub mod features;
 pub mod geometry;
 pub mod matching;
 pub mod maxflow;
+pub mod parallel;
 pub mod seam;
 
 use anyhow::{Result, bail};
@@ -313,6 +314,14 @@ pub fn merge(
     {
         bail!("expected one mask per pass");
     }
+    // The compositor tracks which passes reach a pixel as a bit each.
+    if passes.len() > composite::MAX_PASSES {
+        bail!(
+            "a merge takes at most {} passes; {} were given",
+            composite::MAX_PASSES,
+            passes.len()
+        );
+    }
 
     let mut timings = Vec::new();
     let sizes: Vec<(u32, u32)> = passes.iter().map(|p| (p.width(), p.height())).collect();
@@ -358,6 +367,21 @@ pub fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coverage plane carries a bit per pass, so a group beyond that width
+    /// must be refused rather than silently losing the passes off the end.
+    #[test]
+    fn a_group_wider_than_the_coverage_mask_is_refused() {
+        let pass = DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        let refs: Vec<&DynamicImage> = (0..composite::MAX_PASSES + 1).map(|_| &pass).collect();
+        let Err(error) = merge(&refs, None, 1) else {
+            panic!("a group of {} passes should be refused", refs.len());
+        };
+        assert!(
+            error.to_string().contains("at most"),
+            "unhelpful message: {error}"
+        );
+    }
 
     /// Full-platen passes: whatever the core count, memory is what decides, and
     /// there must always be at least one job.
