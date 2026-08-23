@@ -22,7 +22,13 @@ pub struct Extraction {
 }
 
 /// A swappable foreground extractor.
-pub trait Extractor {
+///
+/// `Send` because an extractor is a long-lived, expensive thing that a library
+/// caller keeps behind a lock and reaches from whichever thread is doing the
+/// work — the agent runs the whole tier-1 flow off the UI thread. Every
+/// implementor is an ONNX session, which is `Send` already; the bound just says
+/// so out loud.
+pub trait Extractor: Send {
     fn extract(&mut self, input: &str) -> Result<Extraction>;
 }
 

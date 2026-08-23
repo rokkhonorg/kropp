@@ -1,26 +1,21 @@
-#[macro_use]
-mod logging;
-#[macro_use]
-mod progress;
-mod angle;
-mod cli;
-mod components;
-mod debug_overlay;
-mod extract;
-mod merge;
-mod model;
-mod output;
-mod pipeline;
+//! The kropp command line. Everything it drives lives in the library crate; this
+//! file is argument handling, input resolution, and the batch loop around
+//! [`kropp::Pipeline::process_image`].
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::cli::Args;
-use crate::model::read_original_image;
-use crate::output::{OutputPlan, suffixed_path};
-use crate::pipeline::{Pipeline, collect_input_paths, output_dir_has_prefix};
+// The library's diagnostics macros are `#[macro_export]`ed, so they arrive at
+// the crate root of `kropp` rather than through a module path.
+use kropp::{elog, say};
+
+use kropp::cli::Args;
+use kropp::model::read_original_image;
+use kropp::output::{OutputPlan, suffixed_path};
+use kropp::pipeline::{Pipeline, collect_input_paths, output_dir_has_prefix};
+use kropp::{logging, merge, progress};
 
 fn main() {
     // When launched from Explorer (double-click or drag-and-drop) the process

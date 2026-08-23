@@ -251,32 +251,29 @@ where
     }
 }
 
-pub fn write_rgb_output(
+/// The RGB crop itself, without writing it anywhere: `src` deskewed by `theta`,
+/// cut to `bounds`, and turned upright by `quarter_turns`.
+///
+/// [`write_rgb_output`] is this followed by an encoder. They are separate
+/// because an interactive caller — the agent's review pass — needs the pixels
+/// in hand to show a contributor before it knows whether the crop is wanted at
+/// all, and re-deriving them after the fact would mean a second deskew.
+///
+/// The source's channel depth is preserved: a 16-bit scan yields a 16-bit crop.
+pub fn render_rgb(
     src: &DynamicImage,
     bounds: RotatedBounds,
     theta: f32,
     quarter_turns: u8,
-    path: &Path,
-    format: OutputFormat,
-) -> Result<(u32, u32)> {
-    match channel_depth(src)? {
+) -> Result<DynamicImage> {
+    Ok(match channel_depth(src)? {
         ChannelDepth::U8 => {
             let src_rgb = src.to_rgb8();
             let mut img = deskew_from_src(&src_rgb, bounds, theta, Rgb([255, 255, 255]));
             if !quarter_turns.is_multiple_of(4) {
                 img = apply_quarter_turns(&img, quarter_turns);
             }
-            let dims = img.dimensions();
-            match format {
-                OutputFormat::Jxl => {
-                    save_jxl(path, img.as_raw(), dims, ColorSpace::RGB, BitDepth::Eight)?
-                }
-                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb8(path, &img)?,
-                OutputFormat::Image(format) => img
-                    .save_with_format(path, format)
-                    .with_context(|| format!("failed to write image: {}", path.display()))?,
-            }
-            Ok(dims)
+            DynamicImage::ImageRgb8(img)
         }
         ChannelDepth::U16 => {
             let src_rgb = src.to_rgb16();
@@ -285,6 +282,30 @@ pub fn write_rgb_output(
             if !quarter_turns.is_multiple_of(4) {
                 img = apply_quarter_turns(&img, quarter_turns);
             }
+            DynamicImage::ImageRgb16(img)
+        }
+    })
+}
+
+/// Encode an already-rendered RGB crop. Split out of [`write_rgb_output`] so a
+/// caller holding pixels from [`render_rgb`] can commit them without a second
+/// deskew — and so the TIFF and JXL special cases live in exactly one place.
+pub fn encode_rgb(img: &DynamicImage, path: &Path, format: OutputFormat) -> Result<(u32, u32)> {
+    match img {
+        DynamicImage::ImageRgb8(img) => {
+            let dims = img.dimensions();
+            match format {
+                OutputFormat::Jxl => {
+                    save_jxl(path, img.as_raw(), dims, ColorSpace::RGB, BitDepth::Eight)?
+                }
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb8(path, img)?,
+                OutputFormat::Image(format) => img
+                    .save_with_format(path, format)
+                    .with_context(|| format!("failed to write image: {}", path.display()))?,
+            }
+            Ok(dims)
+        }
+        DynamicImage::ImageRgb16(img) => {
             let dims = img.dimensions();
             match format {
                 OutputFormat::Jxl => save_jxl(
@@ -294,14 +315,30 @@ pub fn write_rgb_output(
                     ColorSpace::RGB,
                     BitDepth::Sixteen,
                 )?,
-                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb16(path, &img)?,
+                OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb16(path, img)?,
                 OutputFormat::Image(format) => img
                     .save_with_format(path, format)
                     .with_context(|| format!("failed to write image: {}", path.display()))?,
             }
             Ok(dims)
         }
+        other => bail!(
+            "expected an RGB crop from render_rgb, got {:?}",
+            other.color()
+        ),
     }
+}
+
+pub fn write_rgb_output(
+    src: &DynamicImage,
+    bounds: RotatedBounds,
+    theta: f32,
+    quarter_turns: u8,
+    path: &Path,
+    format: OutputFormat,
+) -> Result<(u32, u32)> {
+    let img = render_rgb(src, bounds, theta, quarter_turns)?;
+    encode_rgb(&img, path, format)
 }
 
 pub struct AlphaOutputRequest<'a> {

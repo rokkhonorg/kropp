@@ -19,8 +19,8 @@ use crate::debug_overlay::{
 };
 use crate::extract::{Extraction, Extractor, build_extractor};
 use crate::output::{
-    AlphaOutputRequest, OutputPlan, rotated_crop_bounds, suffixed_path, write_alpha_output,
-    write_rgb_output,
+    AlphaOutputRequest, OutputPlan, RotatedBounds, render_rgb, rotated_crop_bounds, suffixed_path,
+    write_alpha_output, write_rgb_output,
 };
 
 /// Holds the RMBG model and the orientation classifiers. The text detector and
@@ -35,6 +35,20 @@ pub struct Pipeline {
     textline_unavailable: bool,
     doc: Option<DocOrientClassifier>,
     doc_unavailable: bool,
+}
+
+/// Where a processed object goes.
+///
+/// The geometry work — deskew angle, orientation vote, crop bounds — is the
+/// same either way and is not cheap (a text detector and a doc-orientation
+/// model may both run), so the two destinations share one path rather than
+/// being two implementations that could drift. `Memory` is what an interactive
+/// caller reviews: the finished crop, exactly as it would be written, before
+/// anything is written.
+#[derive(Clone, Copy)]
+pub enum ObjectSink<'a> {
+    File(&'a Path, crate::output::OutputFormat),
+    Memory,
 }
 
 impl Pipeline {
@@ -64,6 +78,19 @@ impl Pipeline {
             doc: None,
             doc_unavailable: false,
         })
+    }
+
+    /// Run the extractor over one image and hand back everything it found: the
+    /// RGBA source, the label map, and the objects those labels resolve to.
+    ///
+    /// This is the expensive call — a full segmentation pass over a platen-
+    /// sized scan — and it is the only part of the pipeline a caller cannot
+    /// cheaply repeat, which is why it is exposed separately from
+    /// [`Self::process_image`]. Objects are unfiltered here; `--min-side-percent`
+    /// is applied by whoever consumes them.
+    pub fn extract_image(&mut self, path: &str) -> Result<Extraction> {
+        let _stage = crate::progress::stage("finding objects");
+        self.extractor.extract(path)
     }
 
     /// Foreground mask for one image, row-major at that image's resolution and
@@ -116,7 +143,17 @@ impl Pipeline {
         for (idx, obj) in objects.iter().enumerate() {
             let _stage = crate::progress::stage("cropping");
             crate::progress::detail(format!("object {}/{}", idx + 1, objects.len()));
-            self.process_object(idx, obj, &src, &labels, w, src_original, args, output_plan)?;
+            self.process_object(
+                idx,
+                obj,
+                &src,
+                &labels,
+                w,
+                src_original,
+                args,
+                ObjectSink::File(&output_plan.object_path(idx), output_plan.format),
+                0,
+            )?;
         }
 
         match summary_path {
@@ -126,8 +163,16 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Crop, deskew, upright and either write or return one object.
+    ///
+    /// The output path is passed rather than derived from an [`OutputPlan`] so
+    /// that a caller working object-by-object — the agent, committing only the
+    /// objects a contributor kept — can name each one itself. The batch loop in
+    /// [`Self::process_image`] just passes `output_plan.object_path(idx)`, so
+    /// the CLI's naming is unchanged. `idx` survives only as a label in the
+    /// `--debug` diagnostics.
     #[allow(clippy::too_many_arguments)]
-    fn process_object(
+    pub fn process_object(
         &mut self,
         idx: usize,
         obj: &Object,
@@ -136,8 +181,9 @@ impl Pipeline {
         w: u32,
         src_original: &DynamicImage,
         args: &Args,
-        output_plan: &OutputPlan,
-    ) -> Result<()> {
+        sink: ObjectSink<'_>,
+        extra_turns: u8,
+    ) -> Result<Option<DynamicImage>> {
         // The masked cutout isolates the object — used for text detection (and
         // for the `--alpha` output), so background text/objects don't pollute
         // the angle signal.
@@ -193,7 +239,7 @@ impl Pipeline {
         } else {
             angle::mask_hole_count(&mask, (obj.area / 1000).max(64))
         };
-        let crop_padding = if is_non_rectangular || hole_count > 0 {
+        let crop_padding = if args.pad_all || is_non_rectangular || hole_count > 0 {
             args.non_rectangular_padding
         } else {
             0.0
@@ -274,10 +320,9 @@ impl Pipeline {
             args.debug,
         )?;
 
-        if args.debug {
+        if let (true, ObjectSink::File(path, _)) = (args.debug, sink) {
             self.log_object_debug(
                 obj,
-                idx,
                 labels,
                 w,
                 &cutout,
@@ -297,52 +342,70 @@ impl Pipeline {
                 source,
                 theta,
                 args,
-                output_plan,
+                path,
             )?;
         }
 
-        // Write the cutout (RGBA, transparent background) or, by default, a
-        // plain rectangular RGB crop that keeps the original background.
-        let path = output_plan.object_path(idx);
-        let (out_w, out_h) = if args.alpha {
-            write_alpha_output(
-                src_original,
-                AlphaOutputRequest {
-                    labels,
-                    w: w as usize,
-                    obj,
-                    theta,
-                    quarter_turns,
-                    crop_padding,
-                    path: &path,
-                    format: output_plan.format,
-                },
-            )?
-        } else {
-            // Crop to the fitted rectangle when the mask drove the angle; for a
-            // text-driven deskew `crop_corners` is None and we use component bounds.
+        // The contributor's override rides on top of the classifier's decision
+        // rather than replacing it, so a crop the model got right needs no
+        // correction and one it got wrong needs only the difference.
+        let quarter_turns = (quarter_turns + extra_turns) % 4;
+
+        // Crop to the fitted rectangle when the mask drove the angle; for a
+        // text-driven deskew `crop_corners` is None and we use component bounds.
+        let rgb_bounds = || -> Result<RotatedBounds> {
             let mut bounds = rotated_crop_bounds(crop_corners, labels, w as usize, obj, theta)
                 .context("object has no foreground pixels while cropping")?;
             bounds.expand_percent(crop_padding);
-            // Deskew by sampling the full source, so rotation reveals the real
-            // pixels around the object; padding is used only out of bounds.
-            write_rgb_output(
-                src_original,
-                bounds,
-                theta,
-                quarter_turns,
-                &path,
-                output_plan.format,
-            )?
+            Ok(bounds)
         };
 
-        let angle_note = angle_note(final_angle, source, text_est, quarter_turns);
-        say!(
-            "wrote {} ({out_w}x{out_h}, {} px) angle {angle_note}",
-            path.display(),
-            obj.area
-        );
-        Ok(())
+        match sink {
+            ObjectSink::File(path, format) => {
+                // Write the cutout (RGBA, transparent background) or, by
+                // default, a plain rectangular RGB crop that keeps the original
+                // background.
+                let (out_w, out_h) = if args.alpha {
+                    write_alpha_output(
+                        src_original,
+                        AlphaOutputRequest {
+                            labels,
+                            w: w as usize,
+                            obj,
+                            theta,
+                            quarter_turns,
+                            crop_padding,
+                            path,
+                            format,
+                        },
+                    )?
+                } else {
+                    // Deskew by sampling the full source, so rotation reveals
+                    // the real pixels around the object; padding is used only
+                    // out of bounds.
+                    write_rgb_output(src_original, rgb_bounds()?, theta, quarter_turns, path, format)?
+                };
+
+                let angle_note = angle_note(final_angle, source, text_est, quarter_turns);
+                say!(
+                    "wrote {} ({out_w}x{out_h}, {} px) angle {angle_note}",
+                    path.display(),
+                    obj.area
+                );
+                Ok(None)
+            }
+            ObjectSink::Memory => {
+                if args.alpha {
+                    bail!("rendering to memory does not support --alpha");
+                }
+                Ok(Some(render_rgb(
+                    src_original,
+                    rgb_bounds()?,
+                    theta,
+                    quarter_turns,
+                )?))
+            }
+        }
     }
 
     /// Decide how many 90-degree clockwise turns to apply to a deskewed object so
@@ -425,7 +488,6 @@ impl Pipeline {
     fn log_object_debug(
         &self,
         obj: &Object,
-        idx: usize,
         labels: &[usize],
         w: u32,
         cutout: &image::RgbaImage,
@@ -445,7 +507,7 @@ impl Pipeline {
         source: AngleSource,
         theta: f32,
         args: &Args,
-        output_plan: &OutputPlan,
+        object_path: &Path,
     ) -> Result<()> {
         match rectangularity {
             Some(r) => {
@@ -494,8 +556,7 @@ impl Pipeline {
                 .flatten(),
             final_angle.map(|a| a as f32),
         );
-        let object_path = output_plan.object_path(idx);
-        let dpath = debug_image_path(&object_path);
+        let dpath = debug_image_path(object_path);
         overlay
             .save(&dpath)
             .with_context(|| format!("failed to write debug image: {}", dpath.display()))?;
@@ -514,7 +575,7 @@ impl Pipeline {
         let (dw, dh) = desk.dimensions();
         let cy = dh as f32 / 2.0;
         draw_line_segment_mut(&mut desk, (0.0, cy), (dw as f32, cy), Rgb([150, 150, 150]));
-        let ddpath = suffixed_path(&object_path, ".deskewed");
+        let ddpath = suffixed_path(object_path, ".deskewed");
         desk.save(&ddpath)
             .with_context(|| format!("failed to write debug image: {}", ddpath.display()))?;
         elog!(

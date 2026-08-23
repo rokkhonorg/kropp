@@ -212,6 +212,17 @@ pub struct Args {
     #[arg(long, default_value_t = 2.0)]
     pub non_rectangular_padding: f64,
 
+    /// Apply `--non-rectangular-padding` to every object, not just the
+    /// non-rectangular and holed ones that need breathing room.
+    ///
+    /// A rectangular object is normally cropped flush to its fitted rectangle,
+    /// which is what a finished crop should be. This is for the opposite case:
+    /// a first pass whose crops are going to be looked at and re-cropped later,
+    /// where cutting flush destroys the margin that a second pass — or a human
+    /// deciding the object was mis-detected — would need to recover anything.
+    #[arg(long, default_value_t = false)]
+    pub pad_all: bool,
+
     /// Cut the object out using the mask as an alpha channel (transparent
     /// background, RGBA output). By default crops keep their original
     /// background as a plain rectangular RGB image.
@@ -264,6 +275,15 @@ pub struct Args {
     /// is not given.
     #[arg(long)]
     pub log_file: Option<String>,
+}
+
+/// Every default lives in the `#[arg]` attributes above, so a library caller
+/// gets them the same way the CLI does — by parsing an empty command line —
+/// rather than through a second list that could drift from it.
+impl Default for Args {
+    fn default() -> Self {
+        Self::parse_from(["kropp"])
+    }
 }
 
 impl Args {
