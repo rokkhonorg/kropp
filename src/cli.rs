@@ -254,8 +254,8 @@ pub struct Args {
     pub doc_orient_model: Option<String>,
 
     /// Reprocess directory inputs even when matching outputs already exist.
-    /// Without this, an input whose `<stem>_` outputs are already present is
-    /// skipped.
+    /// Without this, an input whose `<stem>_<index>` crops are already present
+    /// is skipped.
     #[arg(long, default_value_t = false)]
     pub overwrite: bool,
 

@@ -14,7 +14,7 @@ use kropp::{elog, say};
 use kropp::cli::Args;
 use kropp::model::read_original_image;
 use kropp::output::{OutputPlan, suffixed_path};
-use kropp::pipeline::{Pipeline, collect_input_paths, output_dir_has_prefix};
+use kropp::pipeline::{Pipeline, collect_input_paths, output_dir_has_crops};
 use kropp::{logging, merge, progress};
 
 fn main() {
@@ -487,7 +487,7 @@ fn process_directory(
         .context("output directory path is not valid UTF-8")?;
 
     for input_file in collect_input_paths(dir)? {
-        if !args.overwrite && output_dir_has_prefix(output_dir, &input_file)? {
+        if !args.overwrite && output_dir_has_crops(output_dir, &input_file)? {
             if args.debug {
                 elog!("skipping {} (already processed)", input_file.display());
             }

@@ -641,14 +641,13 @@ pub fn collect_input_paths(input: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Whether `output_dir` already holds an output for `input_file` (a file whose
-/// name starts with `<stem>_`), used to skip already-processed inputs.
-pub fn output_dir_has_prefix(output_dir: &Path, input_file: &Path) -> Result<bool> {
+/// Whether `output_dir` already holds a crop of `input_file`, used to skip
+/// already-processed inputs.
+pub fn output_dir_has_crops(output_dir: &Path, input_file: &Path) -> Result<bool> {
     let stem = input_file
         .file_stem()
         .and_then(|s| s.to_str())
         .context("input file name is not valid UTF-8")?;
-    let prefix = format!("{stem}_");
 
     for entry in std::fs::read_dir(output_dir)
         .with_context(|| format!("failed to read output directory: {}", output_dir.display()))?
@@ -660,13 +659,24 @@ pub fn output_dir_has_prefix(output_dir: &Path, input_file: &Path) -> Result<boo
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|name| name.starts_with(&prefix))
+            .is_some_and(|name| is_crop_of(name, stem))
         {
             return Ok(true);
         }
     }
 
     Ok(false)
+}
+
+/// Whether `name` is one of `stem`'s crops, `<stem>_<index>.<ext>` (or a debug
+/// image, `<stem>_<index>.debug.<ext>`). Only a numeric index may follow the
+/// stem: `Front_Back_0.jpg` is a crop of `Front_Back`, not of `Front`, and
+/// counting it would skip `Front` without a word.
+fn is_crop_of(name: &str, stem: &str) -> bool {
+    name.strip_prefix(stem)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(index, _)| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -689,13 +699,54 @@ mod tests {
         let out = dir.join("photo_0.jpg");
         std::fs::write(&out, b"done").unwrap();
 
-        let skipped = output_dir_has_prefix(&dir, Path::new("input/photo.jpg")).unwrap();
-        let other = output_dir_has_prefix(&dir, Path::new("input/other.jpg")).unwrap();
+        let skipped = output_dir_has_crops(&dir, Path::new("input/photo.jpg")).unwrap();
+        let other = output_dir_has_crops(&dir, Path::new("input/other.jpg")).unwrap();
 
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_dir(&dir);
 
         assert!(skipped);
         assert!(!other);
+    }
+
+    /// Scans of one release share a stem's start — `Front` beside
+    /// `Front_Back_Spine`, `Booklet_2_3` beside `Booklet_2_3_4` — and one's
+    /// crops must not make the other look done.
+    #[test]
+    fn a_longer_siblings_crops_do_not_count() {
+        let dir = temp_dir_path();
+        std::fs::create_dir_all(&dir).unwrap();
+        let outs = [
+            dir.join("Front_Back_Spine_0.jpg"),
+            dir.join("Booklet_2_3_4_0.jpg"),
+        ];
+        for out in &outs {
+            std::fs::write(out, b"done").unwrap();
+        }
+
+        let front = output_dir_has_crops(&dir, Path::new("input/Front.tif")).unwrap();
+        let booklet = output_dir_has_crops(&dir, Path::new("input/Booklet_2_3.tif")).unwrap();
+        let sibling = output_dir_has_crops(&dir, Path::new("input/Booklet_2_3_4.tif")).unwrap();
+
+        for out in &outs {
+            let _ = std::fs::remove_file(out);
+        }
+        let _ = std::fs::remove_dir(&dir);
+
+        assert!(!front);
+        assert!(!booklet);
+        assert!(sibling);
+    }
+
+    #[test]
+    fn crop_names_need_a_numeric_index() {
+        assert!(is_crop_of("photo_0.jpg", "photo"));
+        assert!(is_crop_of("photo_12.tif", "photo"));
+        assert!(is_crop_of("photo_0.debug.tif", "photo"));
+        assert!(!is_crop_of("photo_back_0.jpg", "photo"));
+        assert!(!is_crop_of("photo_merged.tif", "photo"));
+        assert!(!is_crop_of("photo_.jpg", "photo"));
+        assert!(!is_crop_of("photo.jpg", "photo"));
+        assert!(!is_crop_of("photograph_0.jpg", "photo"));
     }
 }
