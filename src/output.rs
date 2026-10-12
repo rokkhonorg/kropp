@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use image::{DynamicImage, ImageBuffer, ImageFormat, Pixel, Rgb, Rgba};
+use image::buffer::ConvertBuffer;
+use image::{DynamicImage, ImageBuffer, ImageFormat, Pixel, Rgb, RgbImage, Rgba};
 use imageproc::definitions::Clamp;
 use imageproc::geometric_transformations::{
     Border, Interpolation, Projection, rotate_about_center_no_crop, warp_into,
@@ -290,6 +291,9 @@ pub fn render_rgb(
 /// Encode an already-rendered RGB crop. Split out of [`write_rgb_output`] so a
 /// caller holding pixels from [`render_rgb`] can commit them without a second
 /// deskew — and so the TIFF and JXL special cases live in exactly one place.
+///
+/// A 16-bit crop stays 16-bit wherever the format can hold it; JPEG, WebP, BMP
+/// and QOI can't, and are written from an 8-bit copy instead.
 pub fn encode_rgb(img: &DynamicImage, path: &Path, format: OutputFormat) -> Result<(u32, u32)> {
     match img {
         DynamicImage::ImageRgb8(img) => {
@@ -316,9 +320,14 @@ pub fn encode_rgb(img: &DynamicImage, path: &Path, format: OutputFormat) -> Resu
                     BitDepth::Sixteen,
                 )?,
                 OutputFormat::Image(ImageFormat::Tiff) => save_tiff_rgb16(path, img)?,
-                OutputFormat::Image(format) => img
+                OutputFormat::Image(format @ (ImageFormat::Png | ImageFormat::Pnm)) => img
                     .save_with_format(path, format)
                     .with_context(|| format!("failed to write image: {}", path.display()))?,
+                // Every other encoder `image` has refuses `Rgb16` outright.
+                OutputFormat::Image(_) => {
+                    let img8: RgbImage = img.convert();
+                    return encode_rgb(&DynamicImage::ImageRgb8(img8), path, format);
+                }
             }
             Ok(dims)
         }
@@ -1063,6 +1072,39 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_jxl_signature(&bytes);
+    }
+
+    /// A 16-bit scan written as JPEG is narrowed to 8 bits rather than
+    /// failing, since the JPEG encoder takes nothing wider.
+    #[test]
+    fn jpeg_rgb16_output_is_written_as_8_bit() {
+        let path = temp_image_path("jpg");
+        let mut src: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(8, 6);
+        for (x, y, px) in src.enumerate_pixels_mut() {
+            *px = Rgb([(x * 3000) as u16, (y * 4000) as u16, 40000]);
+        }
+        let bounds = RotatedBounds {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 8.0,
+            max_y: 6.0,
+        };
+
+        let dims = write_rgb_output(
+            &DynamicImage::ImageRgb16(src),
+            bounds,
+            0.0,
+            0,
+            &path,
+            OutputFormat::Image(ImageFormat::Jpeg),
+        )
+        .unwrap();
+        assert_eq!(dims, (8, 6));
+
+        let written = image::open(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(written.color(), image::ColorType::Rgb8);
+        assert_eq!((written.width(), written.height()), (8, 6));
     }
 
     #[test]
