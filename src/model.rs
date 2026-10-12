@@ -74,10 +74,14 @@ pub fn build_sam3() -> Result<SAM3> {
 }
 
 pub fn read_original_image(path: &Path) -> Result<(DynamicImage, ImageFormat)> {
-    let reader = image::ImageReader::open(path)
+    let mut reader = image::ImageReader::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?
         .with_guessed_format()
         .with_context(|| format!("failed to guess image format: {}", path.display()))?;
+    // `image`'s default limits guard against hostile files, and refuse an
+    // honest one: an uncompressed 16-bit platen scan (5100 × 7019, 215 MB in a
+    // single strip) is past the TIFF decoder's buffer cap.
+    reader.no_limits();
     let format = reader
         .format()
         .or_else(|| ImageFormat::from_path(path).ok())

@@ -8,7 +8,16 @@ use usls::Image;
 
 use crate::cli::{Args, ExtractorKind};
 use crate::components::{Object, connected_components};
-use crate::model::build_rmbg;
+use crate::model::{build_rmbg, read_original_image};
+
+/// The source as a model reads it, decoded by kropp's own reader rather than
+/// usls's `Image::try_read`, whose default size limits refuse a large
+/// uncompressed 16-bit platen scan.
+fn read_model_input(input: &str) -> Result<Image> {
+    let (image, _) = read_original_image(std::path::Path::new(input))
+        .with_context(|| format!("failed to read image: {input}"))?;
+    Ok(Image::from(image))
+}
 
 /// The output of an extractor: the source pixels at model resolution plus a
 /// per-pixel label map (0 = background) and its objects, sorted largest-first.
@@ -74,7 +83,7 @@ impl RmbgExtractor {
 
 impl Extractor for RmbgExtractor {
     fn extract(&mut self, input: &str) -> Result<Extraction> {
-        let image = Image::try_read(input).with_context(|| format!("failed to read image: {input}"))?;
+        let image = read_model_input(input)?;
         let ys = self.model.forward(std::slice::from_ref(&image))?;
         let mask = ys
             .first()
@@ -105,8 +114,7 @@ impl Extractor for RmbgExtractor {
 
 #[cfg(feature = "sam3")]
 mod sam3 {
-    use anyhow::{Context, Result};
-    use usls::Image;
+    use anyhow::Result;
     use usls::models::{SAM3, Sam3Prompt};
 
     use super::Extraction;
@@ -134,8 +142,7 @@ mod sam3 {
 
     impl super::Extractor for Sam3BgExtractor {
         fn extract(&mut self, input: &str) -> Result<Extraction> {
-            let image =
-                Image::try_read(input).with_context(|| format!("failed to read image: {input}"))?;
+            let image = super::read_model_input(input)?;
             let prompt = Sam3Prompt::new(&self.background);
             let ys = self
                 .model
@@ -187,8 +194,7 @@ mod sam3 {
 
     impl super::Extractor for Sam3FgExtractor {
         fn extract(&mut self, input: &str) -> Result<Extraction> {
-            let image =
-                Image::try_read(input).with_context(|| format!("failed to read image: {input}"))?;
+            let image = super::read_model_input(input)?;
             let prompts: Vec<Sam3Prompt> =
                 self.prompts.iter().map(|t| Sam3Prompt::new(t)).collect();
             let ys = self.model.forward(std::slice::from_ref(&image), &prompts)?;
